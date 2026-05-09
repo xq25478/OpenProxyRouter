@@ -140,6 +140,35 @@ function responsesBodyToOpenAIChat(body) {
     };
   }
 
+  // Pre-scan: index every function_call_output by its call_id so we can
+  // emit the output immediately after its matching function_call, even when
+  // Codex interleaves reasoning / other messages between the two. Anthropic
+  // requires `tool_use` and `tool_result` to live in adjacent messages, so
+  // we rebuild the order rather than echoing Codex's input sequence.
+  const outputsByCallId = new Map();
+  for (const it of items) {
+    if (it && it.type === "function_call_output" && typeof it.call_id === "string" && it.call_id) {
+      if (!outputsByCallId.has(it.call_id)) {
+        outputsByCallId.set(it.call_id, { item: it, consumed: false });
+      }
+    }
+  }
+
+  // Emit a `role:tool` message for a function_call, pairing with its captured
+  // output (consuming the map entry) or synthesizing an empty result when no
+  // output exists. This guarantees every tool_call has a paired tool output
+  // immediately after it in the Chat message stream.
+  function emitToolResult(call) {
+    const id = call.call_id || call.id || "";
+    const entry = id ? outputsByCallId.get(id) : null;
+    if (entry && !entry.consumed) {
+      entry.consumed = true;
+      messages.push({ role: "tool", tool_call_id: id, content: flattenToolOutput(entry.item.output) });
+    } else {
+      messages.push({ role: "tool", tool_call_id: id, content: "" });
+    }
+  }
+
   let i = 0;
   while (i < items.length) {
     const it = items[i];
@@ -151,6 +180,14 @@ function responsesBodyToOpenAIChat(body) {
     // assistant messages and the tool-call ordering breaks.
     if (t === "reasoning" || t === "web_search_call" || t === "file_search_call" ||
         t === "computer_call" || t === "code_interpreter_call") {
+      i += 1; continue;
+    }
+
+    if (t === "function_call_output") {
+      // Outputs are emitted alongside their matching call above; anything
+      // still visible here is either (a) already consumed, or (b) orphaned
+      // (no matching call). Either way it must be dropped so we never
+      // produce a tool_result without a preceding tool_use.
       i += 1; continue;
     }
 
@@ -166,23 +203,24 @@ function responsesBodyToOpenAIChat(body) {
         // that follow (separated at most by reasoning noise), so text and
         // tool_calls live on the same Chat assistant message.
         const textMsg = toChatMessage(it, "assistant");
-        const toolCalls = [];
+        const calls = [];
         let j = i + 1;
         while (j < items.length) {
           const nt = items[j].type;
           if (nt === "reasoning" || nt === "web_search_call" || nt === "file_search_call" ||
               nt === "computer_call" || nt === "code_interpreter_call") { j += 1; continue; }
-          if (nt === "function_call") { toolCalls.push(makeToolCall(items[j])); j += 1; continue; }
+          if (nt === "function_call") { calls.push(items[j]); j += 1; continue; }
           break;
         }
         const merged = { role: "assistant", content: textMsg ? textMsg.content : null };
-        if (toolCalls.length > 0) {
-          merged.tool_calls = toolCalls;
+        if (calls.length > 0) {
+          merged.tool_calls = calls.map(makeToolCall);
           // Chat requires content to be string or null when tool_calls are
           // present; keep textMsg's string content, otherwise use null.
           if (typeof merged.content !== "string") merged.content = null;
         }
         messages.push(merged);
+        for (const call of calls) emitToolResult(call);
         i = j; continue;
       }
 
@@ -194,27 +232,20 @@ function responsesBodyToOpenAIChat(body) {
     if (t === "function_call") {
       // An assistant turn that consists ONLY of tool calls (no leading text
       // message in the same turn). Fold a run of them — tolerating reasoning
-      // interleaved — into a single assistant message.
-      const toolCalls = [];
+      // interleaved — into a single assistant message, then emit each
+      // matching output immediately after (consuming from outputsByCallId).
+      const calls = [];
       while (i < items.length) {
         const nt = items[i].type;
         if (nt === "reasoning" || nt === "web_search_call" || nt === "file_search_call" ||
             nt === "computer_call" || nt === "code_interpreter_call") { i += 1; continue; }
         if (nt !== "function_call") break;
-        toolCalls.push(makeToolCall(items[i]));
+        calls.push(items[i]);
         i += 1;
       }
-      messages.push({ role: "assistant", content: null, tool_calls: toolCalls });
+      messages.push({ role: "assistant", content: null, tool_calls: calls.map(makeToolCall) });
+      for (const call of calls) emitToolResult(call);
       continue;
-    }
-
-    if (t === "function_call_output") {
-      messages.push({
-        role: "tool",
-        tool_call_id: it.call_id || "",
-        content: flattenToolOutput(it.output),
-      });
-      i += 1; continue;
     }
 
     // Unknown item type — drop silently.

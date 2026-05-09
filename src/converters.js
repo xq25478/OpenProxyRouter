@@ -708,7 +708,99 @@ function openaiBodyToAnthropic(body) {
     if (kwargsBudget !== undefined) req.thinking.budget_tokens = kwargsBudget;
     else req.thinking.budget_tokens = effortToBudget("medium");
   }
+
+  // Anthropic enforces that every `tool_use` block must be followed by a user
+  // message containing a `tool_result` block with a matching `tool_use_id`.
+  // Clients (notably Codex and partial-conversation replays) sometimes omit
+  // trailing tool_results when a tool call was cancelled, or arrive at a
+  // turn boundary mid-tool-call. Without reconciliation Bedrock returns 400
+  // ("`tool_use` ids were found without `tool_result` blocks immediately
+  // after"). Synthesize placeholder tool_results so the conversation validates.
+  reconcileToolUsePairs(req.messages);
+
   return req;
+}
+
+/**
+ * Walk an Anthropic-shape message array and ensure every `tool_use` in an
+ * assistant turn has a matching `tool_result` in the NEXT user message. If a
+ * run of tool_results already exists on the next user message, we append any
+ * missing ones; otherwise we insert a fresh user message. Mutates in place.
+ *
+ * Synthesized placeholders carry a neutral, obviously-artificial string so the
+ * model can tell the call was dropped rather than completed successfully.
+ */
+function reconcileToolUsePairs(messages) {
+  if (!Array.isArray(messages)) return;
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+    if (!m || m.role !== "assistant" || !Array.isArray(m.content)) continue;
+    const toolUses = m.content.filter(b => b && b.type === "tool_use" && b.id);
+    if (toolUses.length === 0) continue;
+
+    // Which ids are already satisfied by a tool_result in the next user msg?
+    const next = messages[i + 1];
+    const satisfied = new Set();
+    let nextResults = null;
+    if (next && next.role === "user" && Array.isArray(next.content)) {
+      nextResults = next.content;
+      for (const b of nextResults) {
+        if (b && b.type === "tool_result" && b.tool_use_id) satisfied.add(b.tool_use_id);
+      }
+    }
+
+    const missing = toolUses.filter(tu => !satisfied.has(tu.id));
+    if (missing.length === 0) continue;
+
+    const placeholders = missing.map(tu => ({
+      type: "tool_result",
+      tool_use_id: tu.id,
+      content: "[tool call was not completed]",
+    }));
+    if (nextResults) {
+      // Prepend so ordering matches the tool_use sequence in the assistant msg
+      // (Anthropic does not require order but it keeps logs readable).
+      next.content = [...placeholders, ...nextResults];
+    } else {
+      messages.splice(i + 1, 0, { role: "user", content: placeholders });
+    }
+  }
+
+  // Reverse pass: any `tool_result` whose id wasn't produced by the prev
+  // assistant's tool_use becomes an orphan. Bedrock rejects those; convert to
+  // a plain text block so content is preserved but the validator passes.
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+    if (!m || m.role !== "user" || !Array.isArray(m.content)) continue;
+    if (!m.content.some(b => b && b.type === "tool_result")) continue;
+
+    const prev = messages[i - 1];
+    const validIds = new Set();
+    if (prev && prev.role === "assistant" && Array.isArray(prev.content)) {
+      for (const b of prev.content) {
+        if (b && b.type === "tool_use" && b.id) validIds.add(b.id);
+      }
+    }
+
+    const rebuilt = [];
+    for (const b of m.content) {
+      if (b && b.type === "tool_result") {
+        if (b.tool_use_id && validIds.has(b.tool_use_id)) {
+          rebuilt.push(b);
+        } else {
+          const txt = typeof b.content === "string"
+            ? b.content
+            : Array.isArray(b.content)
+              ? b.content.filter(x => x && x.type === "text").map(x => x.text).join("")
+              : "";
+          rebuilt.push({ type: "text", text: `[stale tool result ${b.tool_use_id || ""}] ${txt}`.trim() });
+        }
+      } else {
+        rebuilt.push(b);
+      }
+    }
+    m.content = rebuilt;
+  }
 }
 
 // ============================================================

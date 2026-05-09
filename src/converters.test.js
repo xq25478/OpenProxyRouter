@@ -382,16 +382,35 @@ describe("openaiBodyToAnthropic", () => {
     const body = {
       model: "gpt-4",
       max_tokens: 100,
+      messages: [
+        { role: "assistant", content: null, tool_calls: [
+          { id: "call_1", type: "function", function: { name: "weather", arguments: "{}" } }
+        ]},
+        { role: "tool", tool_call_id: "call_1", content: "It's sunny" }
+      ]
+    };
+    const result = openaiBodyToAnthropic(body);
+    const userMsg = result.messages.find(m => m.role === "user");
+    assert.ok(userMsg, "expected a user message carrying tool_result");
+    assert.strictEqual(userMsg.content[0].type, "tool_result");
+    assert.strictEqual(userMsg.content[0].tool_use_id, "call_1");
+  });
+
+  it("orphan tool_result (no preceding assistant tool_use) becomes text", () => {
+    const body = {
+      model: "gpt-4",
+      max_tokens: 100,
       messages: [{
         role: "tool",
         tool_call_id: "call_1",
-        content: "It's sunny"
+        content: "stale output"
       }]
     };
     const result = openaiBodyToAnthropic(body);
-    assert.strictEqual(result.messages[0].role, "user");
-    assert.strictEqual(result.messages[0].content[0].type, "tool_result");
-    assert.strictEqual(result.messages[0].content[0].tool_use_id, "call_1");
+    const userMsg = result.messages.find(m => m.role === "user");
+    assert.ok(userMsg);
+    assert.strictEqual(userMsg.content[0].type, "text");
+    assert.match(userMsg.content[0].text, /stale tool result call_1.*stale output/);
   });
 
   it("converts image_url to image content block", () => {
@@ -452,6 +471,70 @@ describe("openaiBodyToAnthropic", () => {
     });
     assert.strictEqual(result.tool_choice, undefined);
     assert.strictEqual(result.tools, undefined);
+  });
+
+  it("synthesizes a tool_result placeholder for unpaired trailing tool_use", () => {
+    // Simulates Codex replaying a conversation where the final assistant turn
+    // invoked a tool but the tool_result never arrived (cancelled / interrupted).
+    // Without reconciliation Bedrock rejects the request with a 400 complaining
+    // about `tool_use` ids without matching `tool_result` blocks.
+    const body = {
+      model: "claude",
+      messages: [
+        { role: "user", content: "run ls" },
+        { role: "assistant", content: null, tool_calls: [
+          { id: "toolu_abc", type: "function", function: { name: "shell", arguments: "{}" } },
+        ]},
+      ],
+    };
+    const result = openaiBodyToAnthropic(body);
+    assert.strictEqual(result.messages.length, 3);
+    assert.strictEqual(result.messages[2].role, "user");
+    const tr = result.messages[2].content.find(b => b.type === "tool_result");
+    assert.ok(tr, "expected a synthesized tool_result block");
+    assert.strictEqual(tr.tool_use_id, "toolu_abc");
+    assert.ok(typeof tr.content === "string" && tr.content.length > 0);
+  });
+
+  it("does not duplicate tool_result when the next user msg already has one", () => {
+    const body = {
+      model: "claude",
+      messages: [
+        { role: "user", content: "run ls" },
+        { role: "assistant", content: null, tool_calls: [
+          { id: "toolu_abc", type: "function", function: { name: "shell", arguments: "{}" } },
+        ]},
+        { role: "tool", tool_call_id: "toolu_abc", content: "a.txt" },
+      ],
+    };
+    const result = openaiBodyToAnthropic(body);
+    assert.strictEqual(result.messages.length, 3);
+    const userMsg = result.messages[2];
+    assert.strictEqual(userMsg.role, "user");
+    const toolResults = userMsg.content.filter(b => b.type === "tool_result");
+    assert.strictEqual(toolResults.length, 1);
+    assert.strictEqual(toolResults[0].content, "a.txt");
+  });
+
+  it("fills only the missing tool_use id when a partial set of results is present", () => {
+    const body = {
+      model: "claude",
+      messages: [
+        { role: "user", content: "do two things" },
+        { role: "assistant", content: null, tool_calls: [
+          { id: "toolu_a", type: "function", function: { name: "x", arguments: "{}" } },
+          { id: "toolu_b", type: "function", function: { name: "y", arguments: "{}" } },
+        ]},
+        // Only one of the two tool calls got a result
+        { role: "tool", tool_call_id: "toolu_a", content: "done-a" },
+      ],
+    };
+    const result = openaiBodyToAnthropic(body);
+    const userMsg = result.messages[result.messages.length - 1];
+    const ids = userMsg.content.filter(b => b.type === "tool_result").map(b => b.tool_use_id);
+    assert.ok(ids.includes("toolu_a"));
+    assert.ok(ids.includes("toolu_b"));
+    assert.strictEqual(ids.length, 2);
   });
 });
 

@@ -621,3 +621,65 @@ test("round-trip: Anthropic tool history → Chat merges tool_results, preserves
   assert.ok(mergedTurn);
   assert.strictEqual(mergedTurn.content.filter(c => c.type === "tool_result").length, 2);
 });
+
+test("responsesBodyToOpenAIChat - function_call_output paired with function_call by call_id", () => {
+  const chat = responsesBodyToOpenAIChat({
+    model: "m",
+    input: [
+      { type: "message", role: "user", content: [{ type: "input_text", text: "run it" }] },
+      { type: "reasoning", summary: "plan" },
+      { type: "function_call", call_id: "c1", name: "bash", arguments: "{}" },
+      { type: "function_call_output", call_id: "c1", output: "ok" }
+    ]
+  });
+  // assistant(tool_calls:[c1]) must be immediately followed by role:tool(c1)
+  const asst = chat.messages.find(m => m.role === "assistant");
+  const tool = chat.messages.find(m => m.role === "tool");
+  assert.ok(asst && Array.isArray(asst.tool_calls) && asst.tool_calls[0].id === "c1");
+  assert.ok(tool && tool.tool_call_id === "c1" && tool.content === "ok");
+  const idxA = chat.messages.indexOf(asst);
+  const idxT = chat.messages.indexOf(tool);
+  assert.strictEqual(idxT, idxA + 1, "tool result must come immediately after its assistant tool_call");
+});
+
+test("responsesBodyToOpenAIChat - output that appears before its call is reordered", () => {
+  const chat = responsesBodyToOpenAIChat({
+    model: "m",
+    input: [
+      { type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] },
+      { type: "function_call_output", call_id: "c1", output: "late-arriving" },
+      { type: "message", role: "user", content: [{ type: "input_text", text: "middle" }] },
+      { type: "function_call", call_id: "c1", name: "f", arguments: "{}" }
+    ]
+  });
+  const asst = chat.messages.find(m => m.role === "assistant" && Array.isArray(m.tool_calls));
+  const tool = chat.messages.find(m => m.role === "tool");
+  assert.ok(asst && tool);
+  assert.strictEqual(chat.messages.indexOf(tool), chat.messages.indexOf(asst) + 1);
+  assert.strictEqual(tool.content, "late-arriving");
+});
+
+test("responsesBodyToOpenAIChat - function_call without matching output gets empty placeholder", () => {
+  const chat = responsesBodyToOpenAIChat({
+    model: "m",
+    input: [
+      { type: "message", role: "user", content: [{ type: "input_text", text: "run it" }] },
+      { type: "function_call", call_id: "pending", name: "slow", arguments: "{}" }
+    ]
+  });
+  const tool = chat.messages.find(m => m.role === "tool");
+  assert.ok(tool, "orphan tool_call should still produce a paired empty tool message");
+  assert.strictEqual(tool.tool_call_id, "pending");
+  assert.strictEqual(tool.content, "");
+});
+
+test("responsesBodyToOpenAIChat - function_call_output with no matching call is dropped", () => {
+  const chat = responsesBodyToOpenAIChat({
+    model: "m",
+    input: [
+      { type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] },
+      { type: "function_call_output", call_id: "orphan", output: "stale" }
+    ]
+  });
+  assert.strictEqual(chat.messages.some(m => m.role === "tool"), false);
+});
