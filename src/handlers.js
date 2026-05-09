@@ -94,8 +94,20 @@ function sendUpstreamError({ err, ctx, backend, res, req, finish, format }) {
  * "we have an open upstream body, status>=400, no headers sent yet". Returns
  * true when it took ownership of the response, false otherwise.
  */
-function relayUpstreamErrorBody({ statusCode, upstreamBody, ctx, backend, res, req, finish, format, label }) {
+function relayUpstreamErrorBody({ statusCode, upstreamBody, ctx, backend, res, req, finish, format, label, abort }) {
   if (statusCode < 400) return false;
+  // If the downstream client (or fronting proxy) closes the socket while
+  // we're still buffering the upstream error body, abort the upstream
+  // request so we don't keep draining the connection — and stop wasting
+  // wall-clock time before recording the request outcome.
+  let clientGone = false;
+  res.on("close", () => {
+    if (clientGone) return;
+    clientGone = true;
+    if (!res.writableEnded && typeof abort === "function") {
+      try { abort("client_disconnected"); } catch {}
+    }
+  });
   const chunks = [];
   let len = 0;
   upstreamBody.on("data", c => { chunks.push(c); len += c.length; });
@@ -106,15 +118,16 @@ function relayUpstreamErrorBody({ statusCode, upstreamBody, ctx, backend, res, r
       { backend: backend.provider, rid: ctx.rid });
     let parsed;
     try { parsed = JSON.parse(rawBody); } catch {}
-    if (!res.headersSent) {
+    if (!res.headersSent && !clientGone) {
       const body = format === "anthropic"
         ? (parsed && parsed.error ? parsed : { error: { message: rawBody, type: "upstream_error", code: statusCode } })
         : (parsed && parsed.error ? parsed : { error: { message: rawBody, type: "upstream_error", code: statusCode } });
       json(res, statusCode, body, req);
     } else {
-      // Headers already sent (e.g. SSE writeHead(200) raced ahead). Best we
-      // can do is destroy so the client sees a broken stream rather than a
-      // hung "completed" response.
+      // Either headers already went out (SSE writeHead(200) raced ahead) or
+      // the client disconnected while we were buffering. Either way we
+      // can no longer send a structured 4xx/5xx body — destroy so the
+      // client sees a broken connection rather than a hung "completed".
       try { res.destroy(); } catch {}
     }
     onBackendError(backend);
@@ -194,7 +207,7 @@ async function proxyOpenAIChat(req, res, ctx, backend, body) {
   if (statusCode >= 400) {
     return relayUpstreamErrorBody({
       statusCode, upstreamBody, ctx, backend, res, req, finish,
-      format: "anthropic", label: "Anthropic→OpenAI-Chat",
+      format: "anthropic", label: "Anthropic→OpenAI-Chat", abort,
     });
   }
 
@@ -335,7 +348,7 @@ async function proxyAnthropicAsOpenAI(req, res, ctx, backend, parsedBody) {
   if (statusCode >= 400) {
     return relayUpstreamErrorBody({
       statusCode, upstreamBody, ctx, backend, res, req, finish,
-      format: "openai", label: "OpenAI→Anthropic",
+      format: "openai", label: "OpenAI→Anthropic", abort,
     });
   }
 

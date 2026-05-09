@@ -76,7 +76,7 @@ async function proxyResponsesAsOpenAI(req, res, ctx, backend, reqBody) {
   if (statusCode >= 400) {
     return relayUpstreamErrorBody({
       statusCode, upstreamBody, ctx, backend, res, req, finish,
-      format: "responses", label: "Responses→OpenAI-Chat",
+      format: "responses", label: "Responses→OpenAI-Chat", abort,
     });
   }
 
@@ -122,7 +122,7 @@ async function proxyResponsesAsAnthropic(req, res, ctx, backend, reqBody) {
   if (statusCode >= 400) {
     return relayUpstreamErrorBody({
       statusCode, upstreamBody, ctx, backend, res, req, finish,
-      format: "responses", label: "Responses→Anthropic",
+      format: "responses", label: "Responses→Anthropic", abort,
     });
   }
 
