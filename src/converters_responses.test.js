@@ -143,6 +143,72 @@ test("responsesBodyToOpenAIChat - unknown input item types are dropped", () => {
   assert.strictEqual(chat.messages[0].content, "go");
 });
 
+test("responsesBodyToOpenAIChat - developer role collapses to system", () => {
+  const chat = responsesBodyToOpenAIChat({
+    model: "gpt-4o",
+    input: [
+      { type: "message", role: "developer", content: [{ type: "input_text", text: "Be terse." }] },
+      { type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] },
+    ],
+  });
+  assert.strictEqual(chat.messages.length, 2);
+  assert.strictEqual(chat.messages[0].role, "system");
+  assert.strictEqual(chat.messages[0].content, "Be terse.");
+});
+
+test("responsesBodyToOpenAIChat - function_call_output array flattens to text", () => {
+  const chat = responsesBodyToOpenAIChat({
+    model: "gpt-4o",
+    input: [
+      { type: "message", role: "user", content: [{ type: "input_text", text: "run" }] },
+      { type: "function_call", call_id: "c1", name: "shell", arguments: '{"cmd":"ls"}' },
+      { type: "function_call_output", call_id: "c1", output: [
+        { type: "output_text", text: "file1\n" },
+        { type: "output_text", text: "file2" },
+      ] },
+    ],
+  });
+  const toolMsg = chat.messages[chat.messages.length - 1];
+  assert.strictEqual(toolMsg.role, "tool");
+  assert.strictEqual(toolMsg.content, "file1\nfile2");
+});
+
+test("responsesBodyToOpenAIChat - text + function_call in same assistant turn merge to one message", () => {
+  const chat = responsesBodyToOpenAIChat({
+    model: "gpt-4o",
+    input: [
+      { type: "message", role: "user", content: [{ type: "input_text", text: "weather?" }] },
+      { type: "message", role: "assistant", content: [{ type: "output_text", text: "Let me check." }] },
+      { type: "function_call", call_id: "c1", name: "get_weather", arguments: '{}' },
+      { type: "function_call_output", call_id: "c1", output: "72F" },
+    ],
+  });
+  // Assistant text + tool_call should be ONE message (Chat spec).
+  const assistantMsgs = chat.messages.filter(m => m.role === "assistant");
+  assert.strictEqual(assistantMsgs.length, 1);
+  assert.strictEqual(assistantMsgs[0].content, "Let me check.");
+  assert.strictEqual(assistantMsgs[0].tool_calls.length, 1);
+  assert.strictEqual(assistantMsgs[0].tool_calls[0].function.name, "get_weather");
+});
+
+test("responsesBodyToOpenAIChat - reasoning between function_calls does not split assistant turn", () => {
+  const chat = responsesBodyToOpenAIChat({
+    model: "gpt-4o",
+    input: [
+      { type: "message", role: "user", content: [{ type: "input_text", text: "plan" }] },
+      { type: "function_call", call_id: "c1", name: "a", arguments: "{}" },
+      { type: "reasoning", id: "rs_1", summary: [] },
+      { type: "function_call", call_id: "c2", name: "b", arguments: "{}" },
+    ],
+  });
+  const assistantMsgs = chat.messages.filter(m => m.role === "assistant");
+  // Both tool_calls should live on a single assistant message.
+  assert.strictEqual(assistantMsgs.length, 1);
+  assert.strictEqual(assistantMsgs[0].tool_calls.length, 2);
+  assert.strictEqual(assistantMsgs[0].tool_calls[0].function.name, "a");
+  assert.strictEqual(assistantMsgs[0].tool_calls[1].function.name, "b");
+});
+
 // ============================================================
 // openaiChatResponseToResponses (non-streaming)
 // ============================================================

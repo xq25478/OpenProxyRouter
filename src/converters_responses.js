@@ -73,6 +73,38 @@ function toChatMessage(item, role) {
   return { role, content: parts };
 }
 
+/**
+ * Flatten a Responses `function_call_output.output` value into a plain string
+ * suitable for Chat's `tool` message content. The spec allows `output` to be
+ * either a string, or an array of content parts (mirroring `message.content`),
+ * where parts may be `{type:"output_text",text}` or `{type:"output_image",...}`.
+ * Chat's `tool` role content is string-only, so we extract text parts and
+ * leave a `[image omitted]` breadcrumb for image parts rather than silently
+ * JSON-stringifying the whole structure (which the model then has to "parse").
+ */
+function flattenToolOutput(raw) {
+  if (typeof raw === "string") return raw;
+  if (raw == null) return "";
+  if (!Array.isArray(raw)) {
+    try { return JSON.stringify(raw); } catch { return String(raw); }
+  }
+  const pieces = [];
+  for (const p of raw) {
+    if (!p || typeof p !== "object") continue;
+    if (typeof p.text === "string") { pieces.push(p.text); continue; }
+    if (p.type === "output_text" || p.type === "text" || p.type === "input_text") {
+      pieces.push(typeof p.text === "string" ? p.text : "");
+      continue;
+    }
+    if (p.type === "output_image" || p.type === "input_image" || p.type === "image") {
+      pieces.push("[image omitted]");
+      continue;
+    }
+    try { pieces.push(JSON.stringify(p)); } catch { pieces.push(""); }
+  }
+  return pieces.join("");
+}
+
 function responsesBodyToOpenAIChat(body) {
   const messages = [];
 
@@ -91,46 +123,101 @@ function responsesBodyToOpenAIChat(body) {
     items = body.input.filter(it => it && typeof it === "object");
   }
 
-  // Walk items; consecutive function_calls fold into a single assistant msg
-  // (Chat requires tool_calls on the same message).
+  // Fold contiguous assistant-origin items (message / function_call, plus
+  // interleaved reasoning which we skip but that must NOT split the run)
+  // into a single Chat assistant message. Chat requires tool_calls to ride on
+  // the same assistant turn as its text content.
+  function makeToolCall(fc) {
+    return {
+      id: fc.call_id || fc.id || rid("call", 24),
+      type: "function",
+      function: {
+        name: fc.name || "",
+        arguments: typeof fc.arguments === "string"
+          ? fc.arguments
+          : JSON.stringify(fc.arguments || {}),
+      },
+    };
+  }
+
   let i = 0;
   while (i < items.length) {
     const it = items[i];
     const t = it.type;
+
+    // Responses `reasoning` items are assistant-origin metadata between
+    // function_call chunks; drop them but do NOT break the assistant run,
+    // otherwise contiguous function_calls get fragmented into multiple
+    // assistant messages and the tool-call ordering breaks.
+    if (t === "reasoning" || t === "web_search_call" || t === "file_search_call" ||
+        t === "computer_call" || t === "code_interpreter_call") {
+      i += 1; continue;
+    }
+
     if (!t || t === "message") {
-      const role = it.role || "user";
+      // Responses API introduced `developer` as the successor to `system`.
+      // Chat-format backends (and Anthropic-via-Chat) only know user/assistant
+      // /system/tool, so collapse developer → system here.
+      let role = it.role || "user";
+      if (role === "developer") role = "system";
+
+      if (role === "assistant") {
+        // Merge this assistant message with any contiguous function_call items
+        // that follow (separated at most by reasoning noise), so text and
+        // tool_calls live on the same Chat assistant message.
+        const textMsg = toChatMessage(it, "assistant");
+        const toolCalls = [];
+        let j = i + 1;
+        while (j < items.length) {
+          const nt = items[j].type;
+          if (nt === "reasoning" || nt === "web_search_call" || nt === "file_search_call" ||
+              nt === "computer_call" || nt === "code_interpreter_call") { j += 1; continue; }
+          if (nt === "function_call") { toolCalls.push(makeToolCall(items[j])); j += 1; continue; }
+          break;
+        }
+        const merged = { role: "assistant", content: textMsg ? textMsg.content : null };
+        if (toolCalls.length > 0) {
+          merged.tool_calls = toolCalls;
+          // Chat requires content to be string or null when tool_calls are
+          // present; keep textMsg's string content, otherwise use null.
+          if (typeof merged.content !== "string") merged.content = null;
+        }
+        messages.push(merged);
+        i = j; continue;
+      }
+
       const m = toChatMessage(it, role);
       if (m) messages.push(m);
       i += 1; continue;
     }
+
     if (t === "function_call") {
+      // An assistant turn that consists ONLY of tool calls (no leading text
+      // message in the same turn). Fold a run of them — tolerating reasoning
+      // interleaved — into a single assistant message.
       const toolCalls = [];
-      while (i < items.length && items[i].type === "function_call") {
-        const fc = items[i];
-        toolCalls.push({
-          id: fc.call_id || fc.id || rid("call", 24),
-          type: "function",
-          function: {
-            name: fc.name || "",
-            arguments: typeof fc.arguments === "string"
-              ? fc.arguments
-              : JSON.stringify(fc.arguments || {}),
-          },
-        });
+      while (i < items.length) {
+        const nt = items[i].type;
+        if (nt === "reasoning" || nt === "web_search_call" || nt === "file_search_call" ||
+            nt === "computer_call" || nt === "code_interpreter_call") { i += 1; continue; }
+        if (nt !== "function_call") break;
+        toolCalls.push(makeToolCall(items[i]));
         i += 1;
       }
       messages.push({ role: "assistant", content: null, tool_calls: toolCalls });
       continue;
     }
+
     if (t === "function_call_output") {
-      const out = typeof it.output === "string"
-        ? it.output
-        : JSON.stringify(it.output || "");
-      messages.push({ role: "tool", tool_call_id: it.call_id || "", content: out });
+      messages.push({
+        role: "tool",
+        tool_call_id: it.call_id || "",
+        content: flattenToolOutput(it.output),
+      });
       i += 1; continue;
     }
-    // reasoning, web_search_call, file_search_call, computer_call, etc. —
-    // no Chat equivalent, drop silently.
+
+    // Unknown item type — drop silently.
     i += 1;
   }
 

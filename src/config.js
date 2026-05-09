@@ -31,6 +31,14 @@ const SUPPORTED_THINKING_EFFORTS = new Set(["low", "medium", "high", "xhigh", "m
 const CIRCUIT_THRESHOLD = 5;
 const CIRCUIT_OPEN_MS = 10_000;
 
+// Optional gateway-side bearer token. When set (non-empty), every non-health
+// request MUST present a matching `Authorization: Bearer <token>` (or
+// `x-api-key: <token>`) regardless of whether the backend has its own apiKey
+// configured. When UNSET (the default), the gateway is open — backwards
+// compatible with the original single-user desktop-bridge deployment, but
+// explicitly NOT safe to expose to untrusted clients.
+const GATEWAY_API_KEY = (process.env.GATEWAY_API_KEY || "").trim();
+
 const SHUTDOWN_DRAIN_MS = 30_000;
 
 const DISPATCHER_OPTIONS = {
@@ -66,4 +74,5 @@ module.exports = {
   ALLOWED_ORIGINS,
   ALLOWED_METHODS,
   ALLOWED_HEADERS,
+  GATEWAY_API_KEY,
 };

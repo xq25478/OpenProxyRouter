@@ -387,12 +387,12 @@ load_backends_config() {
   local values
 
   values=$(node -e '
-    const backends = require("'"$GATEWAY_DIR"'/backends.json");
+    const { backends } = require("'"$GATEWAY_DIR"'/backends.json");
     const providers = [...new Set(backends.map(b => b.provider || b.type + " backend"))];
-    const allModels = backends.flatMap(b => b.models);
-    const modelLines = backends.flatMap(b => {
+    const allModels = backends.map(b => b.model);
+    const modelLines = backends.map(b => {
       const provider = b.provider || b.type + " backend";
-      return b.models.map(m => m + "\t" + provider + "\t" + b.type);
+      return b.model + "\t" + provider + "\t" + b.type;
     });
     process.stdout.write(
       providers.join("\n") + "\n---\n" +

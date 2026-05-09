@@ -23,6 +23,7 @@ const {
   PORT, MAX_BODY_SIZE, LOCAL_KEEP_ALIVE_TIMEOUT,
   LOCAL_HEADERS_TIMEOUT, TIMEOUT, SHUTDOWN_DRAIN_MS,
   ALLOWED_ORIGINS, ALLOWED_METHODS, ALLOWED_HEADERS,
+  GATEWAY_API_KEY,
 } = require("./src/config");
 
 let store = null;
@@ -78,6 +79,36 @@ function requireApiKey(req, res, ctx, backend) {
   ctx.end(401, { backend: backend.provider, msg: "no api key" });
   json(res, 401, {
     error: { type: "authentication_error", message: "API key required: configure backend.apiKey or send Authorization: Bearer <key>" }
+  }, req);
+  return false;
+}
+
+/**
+ * Gateway-level auth. Enforced on every non-health request when
+ * `GATEWAY_API_KEY` is configured. This is the ONLY layer that actually
+ * authenticates the caller; `requireApiKey` above only guarantees that *some*
+ * key is available to forward upstream (and, when backend.apiKey is set, is
+ * a tautology). Deployments that expose the gateway beyond localhost MUST
+ * set GATEWAY_API_KEY.
+ *
+ * Caveat: if you enable GATEWAY_API_KEY *and* leave a backend.apiKey empty,
+ * the resolveApiKey fallback will forward the gateway key itself to that
+ * upstream. Always pair gateway auth with an explicit per-backend apiKey.
+ */
+function requireGatewayAuth(req, res, ctx) {
+  if (!GATEWAY_API_KEY) return true;
+  const auth = req.headers.authorization;
+  const xKey = req.headers["x-api-key"];
+  let presented = "";
+  if (auth && auth.toLowerCase().startsWith("bearer ")) {
+    presented = auth.slice("bearer ".length).trim();
+  } else if (typeof xKey === "string") {
+    presented = xKey.trim();
+  }
+  if (presented && presented === GATEWAY_API_KEY) return true;
+  ctx.end(401, { msg: "gateway auth failed" });
+  json(res, 401, {
+    error: { type: "authentication_error", message: "Gateway API key required" }
   }, req);
   return false;
 }
@@ -196,6 +227,11 @@ const server = http.createServer((req, res) => {
     return json(res, 405, { error: { type: "method_not_allowed", message: "Method not allowed" } }, req);
   }
 
+  // Gateway-level auth gate. When GATEWAY_API_KEY is unset, this is a no-op
+  // (open gateway, preserves the original desktop-bridge behavior). When set,
+  // every POST must present a matching bearer / x-api-key.
+  if (!requireGatewayAuth(req, res, ctx)) return;
+
   const bodyChunks = [];
   let bodySize = 0;
   let bodyExceeded = false;
@@ -251,7 +287,7 @@ const server = http.createServer((req, res) => {
         return json(res, 503, { error: { type: "backend_unavailable", message: `Backend ${backend.provider} is temporarily unavailable` } }, req);
       }
 
-      ctx.on("route", { backend: backend.provider, model: modelId });
+      ctx.on("route", { backend: backend.provider, model: modelId, upstream_model: backendModelId });
 
       (async () => {
         const upstreamUrl = new URL(backend.baseUrl.replace(/\/+$/, "") + "/v1/messages/count_tokens");
@@ -335,7 +371,7 @@ const server = http.createServer((req, res) => {
 
       const { backend, modelId: backendModelId } = route;
       parsedBody.model = backendModelId;
-      ctx.on("route", { backend: backend.provider, model: modelId });
+      ctx.on("route", { backend: backend.provider, model: modelId, upstream_model: backendModelId });
 
       if (!requireApiKey(req, res, ctx, backend)) return;
 
@@ -373,7 +409,7 @@ const server = http.createServer((req, res) => {
 
       const { backend, modelId: backendModelId } = route;
       parsedBody.model = backendModelId;
-      ctx.on("route", { backend: backend.provider, model: modelId });
+      ctx.on("route", { backend: backend.provider, model: modelId, upstream_model: backendModelId });
 
       if (!requireApiKey(req, res, ctx, backend)) return;
 
@@ -413,7 +449,7 @@ const server = http.createServer((req, res) => {
       parsedBody.model = backendModelId;
       normalizeThinking(parsedBody, backend);
 
-      ctx.on("route", { backend: backend.provider, model: modelId });
+      ctx.on("route", { backend: backend.provider, model: modelId, upstream_model: backendModelId });
 
       if (!requireApiKey(req, res, ctx, backend)) return;
 
