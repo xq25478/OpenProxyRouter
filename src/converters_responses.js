@@ -235,14 +235,18 @@ function responsesBodyToOpenAIChat(body) {
       // Responses function tool has a flat shape: {type:"function", name, description, parameters}.
       // Chat wraps function details under a .function sub-object.
       if (t.type === "function" || (t.name && t.parameters)) {
-        tools.push({
-          type: "function",
-          function: {
-            name: t.name || t.function?.name || "",
-            description: t.description || t.function?.description || "",
-            parameters: t.parameters || t.function?.parameters || { type: "object", properties: {} },
-          },
-        });
+        const fnObj = {
+          name: t.name || t.function?.name || "",
+          description: t.description || t.function?.description || "",
+          parameters: t.parameters || t.function?.parameters || { type: "object", properties: {} },
+        };
+        // OpenAI Chat Completions accepts `strict` on function tools for
+        // structured-outputs JSON schema enforcement. Responses API exposes it
+        // at the top-level tool object; carry it through so schema strictness
+        // isn't silently dropped on the downstream Chat backend.
+        if (typeof t.strict === "boolean") fnObj.strict = t.strict;
+        else if (typeof t.function?.strict === "boolean") fnObj.strict = t.function.strict;
+        tools.push({ type: "function", function: fnObj });
       }
       // Hosted tools dropped — see module docstring.
     }
@@ -311,6 +315,20 @@ function openaiChatResponseToResponses(chatResp, reqBody) {
   const msg = choice?.message || {};
   const output = [];
   let outputText = "";
+
+  // Chat-side reasoner deployments (vLLM / SGLang / DeepSeek / GLM) surface
+  // chain-of-thought in `message.reasoning_content`; Responses clients expect
+  // a dedicated `reasoning` output item with `summary:[{type:"summary_text"}]`.
+  // Emit it BEFORE the message item so the assembled `output` array reflects
+  // the natural "thought then answer" order.
+  if (typeof msg.reasoning_content === "string" && msg.reasoning_content.length > 0) {
+    output.push({
+      type: "reasoning",
+      id: rid("rs"),
+      summary: [{ type: "summary_text", text: msg.reasoning_content }],
+      status: "completed",
+    });
+  }
 
   if (typeof msg.content === "string" && msg.content.length > 0) {
     output.push({
@@ -387,6 +405,9 @@ function createOpenAIChatToResponsesSSETranslator(model, reqBody) {
   let usage = null;
   let nextOutputIndex = 0;
   let msg = null;           // current assistant message item state (or null)
+  // Reasoning item state — opens when the first `delta.reasoning_content`
+  // arrives, closes before any text message or tool_calls are produced.
+  let reasoning = null;     // { id, outputIndex, summaryIndex, textAcc, partOpen }
   const toolByChatIdx = new Map();
   const output = [];        // dense array of items for final response
 
@@ -443,6 +464,79 @@ function createOpenAIChatToResponsesSSETranslator(model, reqBody) {
     if (inProgressEmitted) return "";
     inProgressEmitted = true;
     return sseEvent("response.in_progress", { type: "response.in_progress", response: snapshot("in_progress") });
+  }
+
+  function openReasoning() {
+    const item = {
+      type: "reasoning",
+      id: rid("rs"),
+      status: "in_progress",
+      summary: [],
+    };
+    const outputIndex = nextOutputIndex;
+    nextOutputIndex += 1;
+    output[outputIndex] = item;
+    reasoning = { id: item.id, outputIndex, summaryIndex: 0, textAcc: "", partOpen: false };
+    return sseEvent("response.output_item.added", {
+      type: "response.output_item.added",
+      output_index: outputIndex,
+      item,
+    });
+  }
+  function openReasoningSummaryPart() {
+    const part = { type: "summary_text", text: "" };
+    output[reasoning.outputIndex].summary[reasoning.summaryIndex] = part;
+    reasoning.partOpen = true;
+    return sseEvent("response.reasoning_summary_part.added", {
+      type: "response.reasoning_summary_part.added",
+      item_id: reasoning.id,
+      output_index: reasoning.outputIndex,
+      summary_index: reasoning.summaryIndex,
+      part,
+    });
+  }
+  function emitReasoningDelta(text) {
+    reasoning.textAcc += text;
+    output[reasoning.outputIndex].summary[reasoning.summaryIndex].text = reasoning.textAcc;
+    return sseEvent("response.reasoning_summary_text.delta", {
+      type: "response.reasoning_summary_text.delta",
+      item_id: reasoning.id,
+      output_index: reasoning.outputIndex,
+      summary_index: reasoning.summaryIndex,
+      delta: text,
+    });
+  }
+  function closeReasoning() {
+    if (!reasoning) return "";
+    const parts = [];
+    if (reasoning.partOpen) {
+      const doneText = reasoning.textAcc;
+      const finalPart = { type: "summary_text", text: doneText };
+      parts.push(sseEvent("response.reasoning_summary_text.done", {
+        type: "response.reasoning_summary_text.done",
+        item_id: reasoning.id,
+        output_index: reasoning.outputIndex,
+        summary_index: reasoning.summaryIndex,
+        text: doneText,
+      }));
+      parts.push(sseEvent("response.reasoning_summary_part.done", {
+        type: "response.reasoning_summary_part.done",
+        item_id: reasoning.id,
+        output_index: reasoning.outputIndex,
+        summary_index: reasoning.summaryIndex,
+        part: finalPart,
+      }));
+      reasoning.partOpen = false;
+    }
+    const item = output[reasoning.outputIndex];
+    item.status = "completed";
+    parts.push(sseEvent("response.output_item.done", {
+      type: "response.output_item.done",
+      output_index: reasoning.outputIndex,
+      item,
+    }));
+    reasoning = null;
+    return parts.join("");
   }
 
   function openMessage() {
@@ -523,7 +617,10 @@ function createOpenAIChatToResponsesSSETranslator(model, reqBody) {
     const state = {
       id: rid("fc"),
       outputIndex: nextOutputIndex,
+      // Track whether callId is a synthetic placeholder so a later chunk
+      // that reveals the real upstream id can overwrite it.
       callId: callId || rid("call"),
+      callIdSynthetic: !callId,
       name: name || "",
       argsAcc: "",
     };
@@ -595,6 +692,16 @@ function createOpenAIChatToResponsesSSETranslator(model, reqBody) {
 
       const hasToolCalls = Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0;
       const hasText = typeof delta.content === "string" && delta.content.length > 0;
+      const hasReasoning = typeof delta.reasoning_content === "string" && delta.reasoning_content.length > 0;
+
+      if (hasReasoning) {
+        if (!reasoning) parts.push(openReasoning());
+        if (!reasoning.partOpen) parts.push(openReasoningSummaryPart());
+        parts.push(emitReasoningDelta(delta.reasoning_content));
+      }
+      // Reasoning must be closed before any user-visible output (text or tool)
+      // so the `output` array follows the canonical reasoning-then-answer order.
+      if ((hasText || hasToolCalls) && reasoning) parts.push(closeReasoning());
 
       if (hasText) {
         if (!msg) parts.push(openMessage());
@@ -608,10 +715,21 @@ function createOpenAIChatToResponsesSSETranslator(model, reqBody) {
           const idx = tc.index ?? 0;
           if (!toolByChatIdx.has(idx)) {
             parts.push(openTool(idx, tc.id, tc.function?.name));
-          } else if (tc.function?.name) {
+          } else {
             const st = toolByChatIdx.get(idx);
-            st.name = tc.function.name;
-            output[st.outputIndex].name = tc.function.name;
+            if (tc.function?.name) {
+              st.name = tc.function.name;
+              output[st.outputIndex].name = tc.function.name;
+            }
+            // Backfill the real upstream call id if it was missing in the
+            // first chunk. Prevents the emitted `function_call_output` in a
+            // downstream tool-result round-trip from referencing a gateway
+            // -generated synthetic id the real backend doesn't know.
+            if (tc.id && st.callIdSynthetic) {
+              st.callId = tc.id;
+              st.callIdSynthetic = false;
+              output[st.outputIndex].call_id = tc.id;
+            }
           }
           const args = tc.function?.arguments;
           if (typeof args === "string" && args.length > 0) {
@@ -621,6 +739,7 @@ function createOpenAIChatToResponsesSSETranslator(model, reqBody) {
       }
 
       if (finishReason) {
+        if (reasoning) parts.push(closeReasoning());
         if (msg) parts.push(closeMessage());
         if (toolByChatIdx.size > 0) parts.push(closeTools());
         // response.completed is fired in finalize() — wait for possible
@@ -635,6 +754,7 @@ function createOpenAIChatToResponsesSSETranslator(model, reqBody) {
       completedEmitted = true;
       const parts = [];
       if (!createdEmitted) parts.push(ensureCreated());
+      if (reasoning) parts.push(closeReasoning());
       if (msg) parts.push(closeMessage());
       if (toolByChatIdx.size > 0) parts.push(closeTools());
       const status = err ? "failed" : "completed";

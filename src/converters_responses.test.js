@@ -419,3 +419,205 @@ test("ChatToResponsesSSETranslator - finalize is idempotent", () => {
   assert.ok(first.length > 0);
   assert.strictEqual(second, "");
 });
+
+// ============================================================
+// Responses ↔ Chat reasoning parity + tool passthrough
+// ============================================================
+
+test("openaiChatResponseToResponses - reasoning_content becomes reasoning output item", () => {
+  const resp = openaiChatResponseToResponses({
+    model: "m",
+    choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ans", reasoning_content: "mull it over" } }],
+    usage: { prompt_tokens: 5, completion_tokens: 2 }
+  }, { model: "m" });
+  assert.strictEqual(resp.output.length, 2);
+  assert.strictEqual(resp.output[0].type, "reasoning");
+  assert.strictEqual(resp.output[0].summary[0].type, "summary_text");
+  assert.strictEqual(resp.output[0].summary[0].text, "mull it over");
+  assert.strictEqual(resp.output[1].type, "message");
+});
+
+test("openaiChatResponseToResponses - no reasoning item when reasoning_content absent", () => {
+  const resp = openaiChatResponseToResponses({
+    model: "m",
+    choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ans" } }]
+  }, { model: "m" });
+  assert.ok(!resp.output.find(o => o.type === "reasoning"));
+});
+
+test("responsesBodyToOpenAIChat - tools[].strict forwards through to Chat function.strict", () => {
+  const chat = responsesBodyToOpenAIChat({
+    model: "m",
+    input: "hi",
+    tools: [{ type: "function", name: "f", description: "d", parameters: { type: "object", properties: {} }, strict: true }]
+  });
+  assert.strictEqual(chat.tools.length, 1);
+  assert.strictEqual(chat.tools[0].function.strict, true);
+});
+
+test("responsesBodyToOpenAIChat - parallel_tool_calls:false propagates", () => {
+  const chat = responsesBodyToOpenAIChat({
+    model: "m", input: "hi", parallel_tool_calls: false
+  });
+  assert.strictEqual(chat.parallel_tool_calls, false);
+});
+
+test("createOpenAIChatToResponsesSSETranslator - delta.reasoning_content emits reasoning events in order", () => {
+  const tr = createOpenAIChatToResponsesSSETranslator("m", { model: "m" });
+  const out =
+    tr.translate({ choices: [{ delta: { role: "assistant" }, finish_reason: null }] }) +
+    tr.translate({ choices: [{ delta: { reasoning_content: "part1 " } }] }) +
+    tr.translate({ choices: [{ delta: { reasoning_content: "part2" } }] }) +
+    tr.translate({ choices: [{ delta: { content: "answer" } }] }) +
+    tr.translate({ choices: [{ delta: {}, finish_reason: "stop" }] }) +
+    tr.finalize();
+
+  const events = out.split("\n\n").filter(Boolean).map(blk => {
+    const m = blk.match(/^event: ([^\n]+)/);
+    return m ? m[1] : null;
+  }).filter(Boolean);
+
+  // Reasoning phase must fully close BEFORE text message opens.
+  const firstReasoningDelta = events.indexOf("response.reasoning_summary_text.delta");
+  const reasoningItemDone = events.indexOf("response.output_item.done");
+  const firstTextDelta = events.indexOf("response.output_text.delta");
+  assert.ok(firstReasoningDelta >= 0 && reasoningItemDone >= 0 && firstTextDelta >= 0);
+  assert.ok(firstReasoningDelta < firstTextDelta);
+  assert.ok(reasoningItemDone < firstTextDelta);
+
+  // Summary text was concatenated correctly.
+  assert.ok(out.includes('"delta":"part1 "'));
+  assert.ok(out.includes('"delta":"part2"'));
+});
+
+test("createOpenAIChatToResponsesSSETranslator - reasoning before tool_calls (no text)", () => {
+  const tr = createOpenAIChatToResponsesSSETranslator("m", { model: "m" });
+  const out =
+    tr.translate({ choices: [{ delta: { role: "assistant" } }] }) +
+    tr.translate({ choices: [{ delta: { reasoning_content: "thinking" } }] }) +
+    tr.translate({ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_A", type: "function", function: { name: "f", arguments: "{}" } }] } }] }) +
+    tr.translate({ choices: [{ delta: {}, finish_reason: "tool_calls" }] }) +
+    tr.finalize();
+
+  // Ensure reasoning item was added AND closed before the tool item was added.
+  const lines = out.split("\n");
+  const addedIdxs = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    if (lines[i] === "event: response.output_item.added") addedIdxs.push(i);
+  }
+  assert.ok(addedIdxs.length >= 2, "expected at least two output_item.added (reasoning + tool)");
+});
+
+test("createOpenAIChatToResponsesSSETranslator - tool call_id backfilled when first chunk lacked it", () => {
+  const tr = createOpenAIChatToResponsesSSETranslator("m", { model: "m" });
+  tr.translate({ choices: [{ delta: { role: "assistant" } }] });
+  // First tool chunk: no id, only name
+  tr.translate({ choices: [{ delta: { tool_calls: [{ index: 0, type: "function", function: { name: "fn", arguments: "" } }] } }] });
+  // Later chunk reveals upstream id
+  tr.translate({ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_REAL", function: { arguments: "{}" } }] } }] });
+  const out = tr.translate({ choices: [{ delta: {}, finish_reason: "tool_calls" }] }) + tr.finalize();
+
+  // Search for the output_item.done item with call_id=call_REAL
+  const match = out.match(/"call_id":"([^"]+)"/);
+  assert.ok(match);
+  assert.strictEqual(match[1], "call_REAL");
+});
+
+test("createOpenAIChatToResponsesSSETranslator - synthetic call_id kept when upstream never reveals one", () => {
+  const tr = createOpenAIChatToResponsesSSETranslator("m", { model: "m" });
+  tr.translate({ choices: [{ delta: { role: "assistant" } }] });
+  tr.translate({ choices: [{ delta: { tool_calls: [{ index: 0, type: "function", function: { name: "fn", arguments: "{}" } }] } }] });
+  const out = tr.translate({ choices: [{ delta: {}, finish_reason: "tool_calls" }] }) + tr.finalize();
+  const match = out.match(/"call_id":"(call_[a-f0-9]+)"/);
+  assert.ok(match, "expected synthetic call_... id");
+});
+
+// ============================================================
+// End-to-end: three-protocol round-trip parity
+// ============================================================
+
+test("round-trip: Responses reasoning → Chat → Anthropic preserves thinking", () => {
+  const { openaiBodyToAnthropic } = require("./converters");
+  const chat = responsesBodyToOpenAIChat({
+    model: "m",
+    input: "hi",
+    reasoning: { effort: "high" },
+    max_output_tokens: 500,
+  });
+  assert.strictEqual(chat.reasoning_effort, "high");
+  const anth = openaiBodyToAnthropic(chat);
+  assert.ok(anth.thinking);
+  assert.strictEqual(anth.thinking.type, "enabled");
+  assert.ok(anth.thinking.budget_tokens > 0);
+});
+
+test("round-trip: Anthropic history thinking → Chat reasoning_content → Anthropic thinking", () => {
+  const { anthropicBodyToOpenAIChat, openaiBodyToAnthropic } = require("./converters");
+  const original = {
+    model: "m", max_tokens: 200,
+    messages: [
+      { role: "user", content: "q" },
+      { role: "assistant", content: [
+        { type: "thinking", thinking: "CoT" },
+        { type: "text", text: "ans" }
+      ]},
+      { role: "user", content: "next" }
+    ]
+  };
+  const chat = anthropicBodyToOpenAIChat(original);
+  const back = openaiBodyToAnthropic(chat);
+  const aMsg = back.messages.find(m => m.role === "assistant");
+  assert.ok(Array.isArray(aMsg.content));
+  const thinkBlock = aMsg.content.find(b => b.type === "thinking");
+  assert.ok(thinkBlock);
+  assert.strictEqual(thinkBlock.thinking, "CoT");
+  const textBlock = aMsg.content.find(b => b.type === "text");
+  assert.strictEqual(textBlock.text, "ans");
+});
+
+test("round-trip: parallel_tool_calls:false survives Chat ↔ Anthropic both ways", () => {
+  const { openaiBodyToAnthropic, anthropicBodyToOpenAIChat } = require("./converters");
+  // Chat → Anthropic
+  const anth = openaiBodyToAnthropic({
+    model: "m",
+    messages: [{ role: "user", content: "hi" }],
+    tool_choice: "auto",
+    parallel_tool_calls: false,
+    tools: [{ type: "function", function: { name: "f", parameters: {} } }]
+  });
+  assert.strictEqual(anth.tool_choice.disable_parallel_tool_use, true);
+  // ...and back
+  const chat = anthropicBodyToOpenAIChat(anth);
+  assert.strictEqual(chat.parallel_tool_calls, false);
+});
+
+test("round-trip: Anthropic tool history → Chat merges tool_results, preserves order", () => {
+  const { anthropicBodyToOpenAIChat, openaiBodyToAnthropic } = require("./converters");
+  const original = {
+    model: "m", max_tokens: 100,
+    messages: [
+      { role: "user", content: "go" },
+      { role: "assistant", content: [
+        { type: "tool_use", id: "c1", name: "a", input: { x: 1 } },
+        { type: "tool_use", id: "c2", name: "b", input: { y: 2 } }
+      ]},
+      { role: "user", content: [
+        { type: "tool_result", tool_use_id: "c1", content: "r1" },
+        { type: "tool_result", tool_use_id: "c2", content: "r2" }
+      ]},
+      { role: "assistant", content: "done" }
+    ]
+  };
+  const chat = anthropicBodyToOpenAIChat(original);
+  // Two role:"tool" messages, id order preserved.
+  const toolMsgs = chat.messages.filter(m => m.role === "tool");
+  assert.strictEqual(toolMsgs.length, 2);
+  assert.strictEqual(toolMsgs[0].tool_call_id, "c1");
+  assert.strictEqual(toolMsgs[1].tool_call_id, "c2");
+  // Going back should collapse them into a single user turn with 2 tool_results.
+  const back = openaiBodyToAnthropic(chat);
+  const userTurns = back.messages.filter(m => m.role === "user");
+  const mergedTurn = userTurns.find(m => Array.isArray(m.content) && m.content.some(c => c.type === "tool_result"));
+  assert.ok(mergedTurn);
+  assert.strictEqual(mergedTurn.content.filter(c => c.type === "tool_result").length, 2);
+});

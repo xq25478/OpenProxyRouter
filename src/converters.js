@@ -2,11 +2,52 @@
 
 const crypto = require("crypto");
 const { normalizeUsage } = require("./usage_recorder");
-const { budgetToEffort } = require("./thinking");
+const { budgetToEffort, effortToBudget } = require("./thinking");
 
 // ============================================================
 // Anthropic -> OpenAI Request
 // ============================================================
+
+/**
+ * Flatten an Anthropic `tool_result.content` value into Chat's `role:"tool"`
+ * content shape. Anthropic accepts string | [{type:"text"}|{type:"image"}];
+ * Chat traditionally accepts a plain string, but newer OpenAI SDKs tolerate
+ * an array of content parts. Strategy: if every block is text, concatenate to
+ * string (lossless + friendliest to old servers); else emit an array so the
+ * image parts survive.
+ */
+function toolResultContentToChat(raw) {
+  if (raw == null) return "";
+  if (typeof raw === "string") return raw;
+  if (!Array.isArray(raw)) {
+    try { return JSON.stringify(raw); } catch { return String(raw); }
+  }
+  const parts = [];
+  let onlyText = true;
+  for (const b of raw) {
+    if (b == null) continue;
+    if (typeof b === "string") { parts.push({ type: "text", text: b }); continue; }
+    if (b.type === "text" && typeof b.text === "string") { parts.push({ type: "text", text: b.text }); continue; }
+    if (b.type === "image") {
+      onlyText = false;
+      const src = b.source || {};
+      if (src.type === "base64" && src.data) {
+        parts.push({ type: "image_url", image_url: { url: `data:${src.media_type || "image/png"};base64,${src.data}` } });
+        continue;
+      }
+      if (src.type === "url" && src.url) {
+        parts.push({ type: "image_url", image_url: { url: src.url } });
+        continue;
+      }
+      parts.push({ type: "text", text: "[image omitted]" });
+      continue;
+    }
+    try { parts.push({ type: "text", text: JSON.stringify(b) }); } catch {}
+  }
+  if (parts.length === 0) return "";
+  if (onlyText) return parts.map(p => p.text).join("");
+  return parts;
+}
 
 function anthropicBodyToOpenAIChat(body, backend) {
   const messages = [];
@@ -28,12 +69,20 @@ function anthropicBodyToOpenAIChat(body, backend) {
     const rest = [];
     for (const c of msg.content) {
       if (c.type === "tool_result") {
+        // Anthropic allows `tool_result.content` to be a string OR an array of
+        // content blocks ({type:"text"} / {type:"image"}). Collapse to a plain
+        // string when possible (Chat's conventional shape); if it carries
+        // images, keep the structured array so the image survives the hop.
+        const flat = toolResultContentToChat(c.content);
         const tc = {
           role: "tool",
           tool_call_id: c.tool_use_id || "",
-          content: typeof c.content === "string" ? c.content : JSON.stringify(c.content || "")
+          content: flat
         };
-        if (c.is_error) tc.content = "[ERROR] " + tc.content;
+        if (c.is_error) {
+          if (typeof tc.content === "string") tc.content = "[ERROR] " + tc.content;
+          else tc.content = [{ type: "text", text: "[ERROR]" }, ...(Array.isArray(tc.content) ? tc.content : [])];
+        }
         messages.push(tc);
       } else {
         rest.push(c);
@@ -42,9 +91,16 @@ function anthropicBodyToOpenAIChat(body, backend) {
     if (rest.length > 0) {
       if (msg.role === "assistant") {
         const textParts = [];
+        const thinkingParts = [];
         const toolParts = [];
         for (const c of rest) {
           if (c.type === "text") textParts.push(c.text);
+          // Preserve historical Anthropic `thinking` blocks as Chat
+          // `reasoning_content`, which is the vLLM / SGLang / DeepSeek / GLM
+          // reasoner convention and the same field our OpenAI->Anthropic
+          // response converter emits. Lets multi-turn CoT survive both
+          // directions of translation without vendor-specific plumbing.
+          else if (c.type === "thinking") thinkingParts.push(c.thinking || c.text || "");
           else if (c.type === "tool_use") {
             toolParts.push({
               type: "function",
@@ -55,6 +111,8 @@ function anthropicBodyToOpenAIChat(body, backend) {
         }
         const textContent = textParts.join("");
         const am = { role: "assistant", content: textContent || null };
+        const thinkingContent = thinkingParts.join("");
+        if (thinkingContent) am.reasoning_content = thinkingContent;
         if (toolParts.length > 0) am.tool_calls = toolParts;
         messages.push(am);
       } else {
@@ -112,8 +170,11 @@ function anthropicBodyToOpenAIChat(body, backend) {
     else if (tc.type === "none") req.tool_choice = "none";
     else if (tc.type === "tool" && tc.name) {
       req.tool_choice = { type: "function", function: { name: tc.name } };
-      if (tc.disable_parallel_tool_use) req.parallel_tool_calls = false;
     }
+    // Anthropic's `disable_parallel_tool_use` is valid on auto/any/tool; map
+    // it to Chat's `parallel_tool_calls:false` regardless of which choice
+    // mode was picked so the constraint survives the hop.
+    if (tc.disable_parallel_tool_use === true) req.parallel_tool_calls = false;
   }
 
   applyThinkingToOpenAIRequest(req, body, backend);
@@ -188,12 +249,17 @@ function openaiChatResponseToAnthropic(openaiRes) {
   }
   if (content.length === 0) content.push({ type: "text", text: "" });
 
+  // Map OpenAI Chat finish_reason → Anthropic stop_reason using only values
+  // Anthropic's Messages API documents: end_turn | max_tokens | stop_sequence
+  // | tool_use | pause_turn | refusal. Any non-recognized value falls back to
+  // `end_turn` rather than being passed through as an undefined enum that
+  // would break a strict Anthropic client.
   const fr = choice?.finish_reason;
   let stopReason = "end_turn";
   if (fr === "stop") stopReason = "end_turn";
   else if (fr === "length") stopReason = "max_tokens";
-  else if (fr === "tool_calls") stopReason = "tool_use";
-  else if (fr) stopReason = fr;
+  else if (fr === "tool_calls" || fr === "function_call") stopReason = "tool_use";
+  else if (fr === "content_filter") stopReason = "refusal";
 
   const usage = usageToAnthropicShape(openaiRes.usage);
 
@@ -294,8 +360,9 @@ function createOpenAIToAnthropicSSETranslator(msgId, model) {
   function mapStopReason(fr) {
     if (fr === "stop") return "end_turn";
     if (fr === "length") return "max_tokens";
-    if (fr === "tool_calls") return "tool_use";
-    return fr || "end_turn";
+    if (fr === "tool_calls" || fr === "function_call") return "tool_use";
+    if (fr === "content_filter") return "refusal";
+    return "end_turn";
   }
 
   function closeText() {
@@ -445,6 +512,75 @@ function extractMessageText(content) {
   return out.join("");
 }
 
+/**
+ * Flatten an OpenAI Chat `role:"tool"` content value into a shape suitable for
+ * Anthropic's `tool_result.content`. Anthropic accepts either a string or an
+ * array of `{type:"text",text}` / `{type:"image",source}` blocks. Chat's tool
+ * content is usually a string, but some callers send arrays of parts; preserve
+ * them in structured form rather than JSON.stringify'ing the whole payload.
+ */
+function toolContentForAnthropic(raw) {
+  if (raw == null) return "";
+  if (typeof raw === "string") return raw;
+  if (!Array.isArray(raw)) {
+    try { return JSON.stringify(raw); } catch { return String(raw); }
+  }
+  const parts = [];
+  for (const p of raw) {
+    if (p == null) continue;
+    if (typeof p === "string") { parts.push({ type: "text", text: p }); continue; }
+    if (typeof p !== "object") continue;
+    if (p.type === "text" && typeof p.text === "string") { parts.push({ type: "text", text: p.text }); continue; }
+    if (p.type === "image_url") {
+      const url = p.image_url?.url || "";
+      if (url.startsWith("data:")) {
+        const m = url.match(/^data:([^;]+);base64,(.+)$/);
+        if (m) { parts.push({ type: "image", source: { type: "base64", media_type: m[1], data: m[2] } }); continue; }
+      }
+      if (url) { parts.push({ type: "image", source: { type: "url", url } }); continue; }
+    }
+    if (typeof p.text === "string") { parts.push({ type: "text", text: p.text }); continue; }
+    try { parts.push({ type: "text", text: JSON.stringify(p) }); } catch {}
+  }
+  if (parts.length === 0) return "";
+  return parts;
+}
+
+/**
+ * Translate a Chat-shape content value (string | array-of-parts) into the
+ * Anthropic-shape content blocks expected on a user/assistant message that
+ * does not carry tool_calls. The caller handles tool_use / tool_result
+ * plumbing outside this helper.
+ */
+function chatContentToAnthropicBlocks(raw) {
+  if (raw == null) return [];
+  if (typeof raw === "string") {
+    return raw === "" ? [] : [{ type: "text", text: raw }];
+  }
+  if (!Array.isArray(raw)) {
+    const t = extractMessageText(raw);
+    return t ? [{ type: "text", text: t }] : [];
+  }
+  const out = [];
+  for (const part of raw) {
+    if (part == null) continue;
+    if (typeof part === "string") { if (part) out.push({ type: "text", text: part }); continue; }
+    if (part.type === "text") { if (part.text) out.push({ type: "text", text: part.text }); continue; }
+    if (part.type === "image_url") {
+      const url = part.image_url?.url || "";
+      if (url.startsWith("data:")) {
+        const m = url.match(/^data:([^;]+);base64,(.+)$/);
+        if (m) { out.push({ type: "image", source: { type: "base64", media_type: m[1], data: m[2] } }); continue; }
+      }
+      if (url) out.push({ type: "image", source: { type: "url", url } });
+      continue;
+    }
+    // Unknown part → dump as text JSON so it is at least visible.
+    try { out.push({ type: "text", text: JSON.stringify(part) }); } catch {}
+  }
+  return out;
+}
+
 function openaiBodyToAnthropic(body) {
   const messages = [];
   // Anthropic accepts a single top-level `system` string; when the upstream
@@ -452,46 +588,73 @@ function openaiBodyToAnthropic(body) {
   // + a `developer` role message), concatenate rather than overwrite so no
   // directive is silently dropped.
   const systemParts = [];
+  const inputMessages = Array.isArray(body.messages) ? body.messages : [];
 
-  for (const msg of body.messages || []) {
+  let i = 0;
+  while (i < inputMessages.length) {
+    const msg = inputMessages[i];
+    if (!msg || typeof msg !== "object") { i += 1; continue; }
+
     if (msg.role === "system" || msg.role === "developer") {
       const txt = extractMessageText(msg.content);
       if (txt) systemParts.push(txt);
-      continue;
+      i += 1; continue;
     }
-    if (msg.role === "assistant" && Array.isArray(msg.tool_calls)) {
+
+    if (msg.role === "assistant") {
       const content = [];
-      if (msg.content) content.push({ type: "text", text: msg.content });
-      for (const tc of msg.tool_calls) {
-        let input = {};
-        try { input = JSON.parse(tc.function?.arguments || "{}"); } catch {}
-        content.push({ type: "tool_use", id: tc.id, name: tc.function?.name || "", input });
+      // reasoning_content (e.g. DeepSeek / GLM / Qwen reasoner output, or
+      // passthrough from a previous Anthropic turn) becomes an Anthropic
+      // thinking block so multi-turn CoT survives the round-trip.
+      if (typeof msg.reasoning_content === "string" && msg.reasoning_content.length > 0) {
+        content.push({ type: "thinking", thinking: msg.reasoning_content });
       }
+      // Text content may arrive either as a string (common) or as an array of
+      // Chat parts (legal per OpenAI, historically seen). Flatten correctly;
+      // a plain string shortcut avoids the overhead when it is already one.
+      if (typeof msg.content === "string" && msg.content.length > 0) {
+        content.push({ type: "text", text: msg.content });
+      } else if (Array.isArray(msg.content)) {
+        for (const b of chatContentToAnthropicBlocks(msg.content)) content.push(b);
+      }
+      if (Array.isArray(msg.tool_calls)) {
+        for (const tc of msg.tool_calls) {
+          let input = {};
+          try { input = JSON.parse(tc.function?.arguments || "{}"); } catch {}
+          content.push({ type: "tool_use", id: tc.id, name: tc.function?.name || "", input });
+        }
+      }
+      if (content.length === 0) content.push({ type: "text", text: "" });
       messages.push({ role: "assistant", content });
-      continue;
+      i += 1; continue;
     }
+
     if (msg.role === "tool") {
-      const content = [{ type: "tool_result", tool_use_id: msg.tool_call_id || "", content: msg.content || "" }];
-      messages.push({ role: "user", content });
+      // Anthropic requires all tool_results produced in response to the SAME
+      // preceding assistant turn to live in a SINGLE user message. Coalesce
+      // a contiguous run of OpenAI tool messages here.
+      const block = [];
+      while (i < inputMessages.length && inputMessages[i] && inputMessages[i].role === "tool") {
+        const tm = inputMessages[i];
+        const flat = toolContentForAnthropic(tm.content);
+        block.push({ type: "tool_result", tool_use_id: tm.tool_call_id || "", content: flat });
+        i += 1;
+      }
+      messages.push({ role: "user", content: block });
       continue;
     }
+
+    // Regular user / (assistant that somehow reached here with no tool_calls).
     if (typeof msg.content === "string") {
       messages.push({ role: toAnthropicRole(msg.role), content: msg.content });
     } else if (Array.isArray(msg.content)) {
-      const content = msg.content.map(part => {
-        if (part.type === "text") return { type: "text", text: part.text };
-        if (part.type === "image_url") {
-          const url = part.image_url?.url || "";
-          if (url.startsWith("data:")) {
-            const m = url.match(/^data:([^;]+);base64,(.+)$/);
-            if (m) return { type: "image", source: { type: "base64", media_type: m[1], data: m[2] } };
-          }
-          return { type: "image", source: { type: "url", url } };
-        }
-        return { type: "text", text: JSON.stringify(part) };
-      });
+      const content = chatContentToAnthropicBlocks(msg.content);
       messages.push({ role: toAnthropicRole(msg.role), content });
+    } else {
+      const t = extractMessageText(msg.content);
+      if (t) messages.push({ role: toAnthropicRole(msg.role), content: t });
     }
+    i += 1;
   }
 
   const req = { model: body.model, messages, max_tokens: body.max_tokens || 4096 };
@@ -518,6 +681,32 @@ function openaiBodyToAnthropic(body) {
       delete req.tools;
     }
     else if (typeof body.tool_choice === "object") req.tool_choice = { type: "tool", name: body.tool_choice.function?.name || "" };
+  }
+  // Chat's `parallel_tool_calls:false` ⇒ Anthropic's tool_choice.disable_parallel_tool_use.
+  // Only valid on Anthropic when tool_choice is set (auto/any/tool); if the
+  // caller passed `tool_choice:"none"` we already stripped the tools array
+  // so no further flag is meaningful.
+  if (body.parallel_tool_calls === false && req.tool_choice && req.tool_choice.type !== undefined) {
+    req.tool_choice.disable_parallel_tool_use = true;
+  }
+
+  // Map Chat-side reasoning hints back to Anthropic `thinking`. Two shapes are
+  // recognized so Responses→Chat→Anthropic and Chat→Anthropic both preserve
+  // reasoning intent without any extra wire field:
+  //   - OpenAI o-series: `reasoning_effort: "low"|"medium"|"high"|"xhigh"|"max"`
+  //   - vLLM / SGLang / DeepSeek / GLM: `chat_template_kwargs.enable_thinking`
+  //     with optional `thinking_budget`.
+  // We do NOT synthesize thinking when neither hint is present (don't enable
+  // reasoning for callers who didn't ask for it).
+  const kwargs = (body && typeof body === "object" && body.chat_template_kwargs && typeof body.chat_template_kwargs === "object") ? body.chat_template_kwargs : null;
+  const kwargsEnabled = !!(kwargs && kwargs.enable_thinking);
+  const kwargsBudget = kwargs && typeof kwargs.thinking_budget === "number" ? kwargs.thinking_budget : undefined;
+  if (typeof body.reasoning_effort === "string" && body.reasoning_effort.length > 0) {
+    req.thinking = { type: "enabled", budget_tokens: effortToBudget(body.reasoning_effort) };
+  } else if (kwargsEnabled) {
+    req.thinking = { type: "enabled" };
+    if (kwargsBudget !== undefined) req.thinking.budget_tokens = kwargsBudget;
+    else req.thinking.budget_tokens = effortToBudget("medium");
   }
   return req;
 }
@@ -551,10 +740,11 @@ function anthropicResponseToOpenAIChat(anthropicRes) {
   const finishReason = (() => {
     if (toolParts.length > 0) return "tool_calls";
     const sr = anthropicRes.stop_reason;
-    if (sr === "end_turn" || sr === "stop") return "stop";
+    if (sr === "end_turn" || sr === "stop" || sr === "stop_sequence" || sr === "pause_turn") return "stop";
     if (sr === "max_tokens") return "length";
     if (sr === "tool_use") return "tool_calls";
-    return sr || "stop";
+    if (sr === "refusal" || sr === "content_filter") return "content_filter";
+    return "stop";
   })();
 
   const anthUsage = usageToAnthropicShape(anthropicRes.usage);
@@ -589,6 +779,12 @@ function anthropicResponseToOpenAIChat(anthropicRes) {
  */
 function createAnthropicToOpenAISSETranslator(chatId, model) {
   const acc = { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0 };
+  // Anthropic content_block indices mix text / thinking / tool_use in a
+  // single counter. OpenAI Chat tool_calls[].index is a dense 0-based index
+  // into the assistant's tool_calls array ONLY. Map content-block index →
+  // tool index so parallel tool calls round-trip with the correct shape.
+  const toolIndexByAnthIdx = new Map();
+  let nextToolIndex = 0;
 
   function translate(line) {
     if (!line.startsWith("data: ")) return "";
@@ -612,9 +808,13 @@ function createAnthropicToOpenAISSETranslator(chatId, model) {
     if (evt.type === "content_block_start") {
       const block = evt.content_block || {};
       if (block.type === "tool_use") {
+        const anthIdx = typeof evt.index === "number" ? evt.index : 0;
+        const toolIdx = nextToolIndex;
+        toolIndexByAnthIdx.set(anthIdx, toolIdx);
+        nextToolIndex += 1;
         return `data: ${JSON.stringify({
           id: chatId, object: "chat.completion.chunk", created: now, model,
-          choices: [{ index: 0, delta: { tool_calls: [{ index: evt.index || 0, id: block.id, type: "function", function: { name: block.name || "", arguments: "" } }] }, finish_reason: null }]
+          choices: [{ index: 0, delta: { tool_calls: [{ index: toolIdx, id: block.id, type: "function", function: { name: block.name || "", arguments: "" } }] }, finish_reason: null }]
         })}\n\n`;
       }
       return "";
@@ -639,9 +839,13 @@ function createAnthropicToOpenAISSETranslator(chatId, model) {
         })}\n\n`;
       }
       if (delta.type === "input_json_delta" && delta.partial_json) {
+        const anthIdx = typeof evt.index === "number" ? evt.index : 0;
+        const toolIdx = toolIndexByAnthIdx.has(anthIdx)
+          ? toolIndexByAnthIdx.get(anthIdx)
+          : 0;
         return `data: ${JSON.stringify({
           id: chatId, object: "chat.completion.chunk", created: now, model,
-          choices: [{ index: 0, delta: { tool_calls: [{ index: evt.index || 0, function: { arguments: delta.partial_json } }] }, finish_reason: null }]
+          choices: [{ index: 0, delta: { tool_calls: [{ index: toolIdx, function: { arguments: delta.partial_json } }] }, finish_reason: null }]
         })}\n\n`;
       }
       return "";
@@ -653,10 +857,12 @@ function createAnthropicToOpenAISSETranslator(chatId, model) {
 
       let finishReason = null;
       if (d.stop_reason) {
-        if (d.stop_reason === "end_turn" || d.stop_reason === "stop") finishReason = "stop";
-        else if (d.stop_reason === "tool_use") finishReason = "tool_calls";
-        else if (d.stop_reason === "max_tokens") finishReason = "length";
-        else finishReason = d.stop_reason;
+        const sr = d.stop_reason;
+        if (sr === "end_turn" || sr === "stop" || sr === "stop_sequence" || sr === "pause_turn") finishReason = "stop";
+        else if (sr === "tool_use") finishReason = "tool_calls";
+        else if (sr === "max_tokens") finishReason = "length";
+        else if (sr === "refusal" || sr === "content_filter") finishReason = "content_filter";
+        else finishReason = "stop";
       }
       const anthUsage = {
         input_tokens: acc.input_tokens,

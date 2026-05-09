@@ -768,3 +768,228 @@ describe("parseAnthropicSSEUsage", () => {
     assert.deepStrictEqual(acc, { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0 });
   });
 });
+// ============================================================
+// Protocol round-trip coverage — function_call + thinking parity
+// ============================================================
+
+describe("anthropicBodyToOpenAIChat - thinking block handling", () => {
+  it("preserves historical thinking blocks as reasoning_content", () => {
+    const body = {
+      model: "m",
+      max_tokens: 200,
+      messages: [
+        { role: "user", content: "think" },
+        { role: "assistant", content: [
+          { type: "thinking", thinking: "deliberating..." },
+          { type: "text", text: "final" }
+        ]}
+      ]
+    };
+    const out = anthropicBodyToOpenAIChat(body);
+    const assistant = out.messages.find(m => m.role === "assistant");
+    assert.strictEqual(assistant.reasoning_content, "deliberating...");
+    assert.strictEqual(assistant.content, "final");
+  });
+
+  it("omits reasoning_content when no thinking block present", () => {
+    const body = {
+      model: "m", max_tokens: 10,
+      messages: [{ role: "assistant", content: [{ type: "text", text: "hi" }] }]
+    };
+    const out = anthropicBodyToOpenAIChat(body);
+    const a = out.messages.find(m => m.role === "assistant");
+    assert.strictEqual("reasoning_content" in a, false);
+  });
+
+  it("flattens tool_result text blocks to string", () => {
+    const body = {
+      model: "m", max_tokens: 10,
+      messages: [{ role: "user", content: [
+        { type: "tool_result", tool_use_id: "x", content: [
+          { type: "text", text: "a" },
+          { type: "text", text: "b" }
+        ]}
+      ]}]
+    };
+    const out = anthropicBodyToOpenAIChat(body);
+    const t = out.messages.find(m => m.role === "tool");
+    assert.strictEqual(t.content, "ab");
+  });
+
+  it("preserves tool_result image blocks as structured array", () => {
+    const body = {
+      model: "m", max_tokens: 10,
+      messages: [{ role: "user", content: [
+        { type: "tool_result", tool_use_id: "x", content: [
+          { type: "text", text: "see" },
+          { type: "image", source: { type: "url", url: "https://e.co/i.png" } }
+        ]}
+      ]}]
+    };
+    const out = anthropicBodyToOpenAIChat(body);
+    const t = out.messages.find(m => m.role === "tool");
+    assert.ok(Array.isArray(t.content));
+    assert.strictEqual(t.content[0].type, "text");
+    assert.strictEqual(t.content[1].type, "image_url");
+    assert.strictEqual(t.content[1].image_url.url, "https://e.co/i.png");
+  });
+
+  it("maps Anthropic disable_parallel_tool_use to Chat parallel_tool_calls:false", () => {
+    const body = {
+      model: "m", max_tokens: 10,
+      messages: [{ role: "user", content: "hi" }],
+      tool_choice: { type: "auto", disable_parallel_tool_use: true }
+    };
+    const out = anthropicBodyToOpenAIChat(body);
+    assert.strictEqual(out.parallel_tool_calls, false);
+    assert.strictEqual(out.tool_choice, "auto");
+  });
+});
+
+describe("openaiBodyToAnthropic - reasoning round-trip", () => {
+  it("coalesces multiple tool messages into a single user turn", () => {
+    const body = {
+      model: "m",
+      messages: [
+        { role: "assistant", content: null, tool_calls: [
+          { id: "c1", type: "function", function: { name: "a", arguments: "{}" } },
+          { id: "c2", type: "function", function: { name: "b", arguments: "{}" } }
+        ]},
+        { role: "tool", tool_call_id: "c1", content: "r1" },
+        { role: "tool", tool_call_id: "c2", content: "r2" }
+      ]
+    };
+    const out = openaiBodyToAnthropic(body);
+    // expect: assistant (tool_use*2) + user (tool_result*2)
+    assert.strictEqual(out.messages.length, 2);
+    assert.strictEqual(out.messages[1].role, "user");
+    assert.ok(Array.isArray(out.messages[1].content));
+    assert.strictEqual(out.messages[1].content.length, 2);
+    assert.strictEqual(out.messages[1].content[0].type, "tool_result");
+    assert.strictEqual(out.messages[1].content[1].type, "tool_result");
+  });
+
+  it("flattens assistant array content + tool_calls without nested arrays", () => {
+    const body = {
+      model: "m",
+      messages: [{ role: "assistant", content: [
+        { type: "text", text: "hi " }, { type: "text", text: "there" }
+      ], tool_calls: [
+        { id: "c", type: "function", function: { name: "f", arguments: "{}" } }
+      ]}]
+    };
+    const out = openaiBodyToAnthropic(body);
+    const blocks = out.messages[0].content;
+    // Every block must be a legal Anthropic block with a scalar payload.
+    for (const b of blocks) {
+      if (b.type === "text") assert.strictEqual(typeof b.text, "string");
+      else if (b.type === "tool_use") assert.strictEqual(typeof b.id, "string");
+      else assert.fail("unexpected block type " + b.type);
+    }
+  });
+
+  it("assistant.reasoning_content → Anthropic thinking block", () => {
+    const body = {
+      model: "m",
+      messages: [{ role: "assistant", content: "ans", reasoning_content: "mull" }]
+    };
+    const out = openaiBodyToAnthropic(body);
+    const blocks = out.messages[0].content;
+    assert.strictEqual(blocks[0].type, "thinking");
+    assert.strictEqual(blocks[0].thinking, "mull");
+  });
+
+  it("Chat reasoning_effort → Anthropic thinking with matching budget", () => {
+    const out = openaiBodyToAnthropic({
+      model: "m", messages: [{ role: "user", content: "hi" }], reasoning_effort: "high"
+    });
+    assert.ok(out.thinking);
+    assert.strictEqual(out.thinking.type, "enabled");
+    assert.strictEqual(out.thinking.budget_tokens, 16384);
+  });
+
+  it("chat_template_kwargs.enable_thinking → Anthropic thinking", () => {
+    const out = openaiBodyToAnthropic({
+      model: "m", messages: [{ role: "user", content: "hi" }],
+      chat_template_kwargs: { enable_thinking: true, thinking_budget: 4096 }
+    });
+    assert.deepStrictEqual(out.thinking, { type: "enabled", budget_tokens: 4096 });
+  });
+
+  it("Chat parallel_tool_calls:false → Anthropic tool_choice.disable_parallel_tool_use", () => {
+    const out = openaiBodyToAnthropic({
+      model: "m",
+      messages: [{ role: "user", content: "hi" }],
+      tool_choice: "auto",
+      parallel_tool_calls: false,
+      tools: [{ type: "function", function: { name: "f", parameters: {} } }]
+    });
+    assert.strictEqual(out.tool_choice.type, "auto");
+    assert.strictEqual(out.tool_choice.disable_parallel_tool_use, true);
+  });
+
+  it("does not fabricate thinking when not requested", () => {
+    const out = openaiBodyToAnthropic({
+      model: "m", messages: [{ role: "user", content: "hi" }]
+    });
+    assert.strictEqual(out.thinking, undefined);
+  });
+});
+
+describe("stop_reason / finish_reason mapping", () => {
+  it("Anthropic stop_sequence → Chat stop", () => {
+    const r = anthropicResponseToOpenAIChat({
+      content: [{ type: "text", text: "x" }], stop_reason: "stop_sequence"
+    });
+    assert.strictEqual(r.choices[0].finish_reason, "stop");
+  });
+
+  it("Anthropic refusal → Chat content_filter", () => {
+    const r = anthropicResponseToOpenAIChat({
+      content: [{ type: "text", text: "" }], stop_reason: "refusal"
+    });
+    assert.strictEqual(r.choices[0].finish_reason, "content_filter");
+  });
+
+  it("Chat content_filter → Anthropic refusal", () => {
+    const r = openaiChatResponseToAnthropic({
+      choices: [{ finish_reason: "content_filter", message: { role: "assistant", content: "" } }]
+    });
+    assert.strictEqual(r.stop_reason, "refusal");
+  });
+
+  it("Chat function_call → Anthropic tool_use (legacy)", () => {
+    const r = openaiChatResponseToAnthropic({
+      choices: [{ finish_reason: "function_call", message: { role: "assistant", content: "" } }]
+    });
+    assert.strictEqual(r.stop_reason, "tool_use");
+  });
+});
+
+describe("createAnthropicToOpenAISSETranslator - tool index remap", () => {
+  it("assigns dense 0-based tool_calls[].index across content-block indexes", () => {
+    const t = createAnthropicToOpenAISSETranslator("c", "m");
+    const evs = [
+      'data: {"type":"message_start","message":{"id":"m","role":"assistant","model":"m","content":[],"usage":{"input_tokens":1,"output_tokens":0}}}',
+      'data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}',
+      'data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}',
+      'data: {"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"A","name":"f1","input":{}}}',
+      'data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\\"a\\":1}"}}',
+      'data: {"type":"content_block_start","index":3,"content_block":{"type":"tool_use","id":"B","name":"f2","input":{}}}',
+      'data: {"type":"content_block_delta","index":3,"delta":{"type":"input_json_delta","partial_json":"{\\"b\\":2}"}}',
+      'data: {"type":"message_stop"}'
+    ];
+    let out = "";
+    for (const e of evs) out += t.translate(e);
+    const indexes = [];
+    for (const line of out.split("\n")) {
+      if (!line.startsWith("data: ")) continue;
+      if (line.includes("[DONE]")) continue;
+      let obj; try { obj = JSON.parse(line.slice(6)); } catch { continue; }
+      const tc = obj?.choices?.[0]?.delta?.tool_calls;
+      if (Array.isArray(tc)) for (const x of tc) indexes.push(x.index);
+    }
+    // First tool_use got index 0, second got 1 — NOT 2/3 from content-block indexes.
+    assert.deepStrictEqual(Array.from(new Set(indexes)).sort(), [0, 1]);
+  });
+});
