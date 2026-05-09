@@ -112,6 +112,24 @@ describe("anthropicBodyToOpenAIChat", () => {
     assert.strictEqual(resultNone.tool_choice, "none");
   });
 
+  it("downgrades tool_choice {type:'tool'} without name to 'required'", () => {
+    // Anthropic spec requires `name` when `type:'tool'`, but malformed clients
+    // sometimes drop it. Old behavior silently fell through to no tool_choice
+    // (auto), losing the caller's "must use a tool" intent. We now preserve
+    // that intent by mapping to `required`.
+    const result = anthropicBodyToOpenAIChat({
+      model: "x", max_tokens: 100, messages: [{ role: "user", content: "Hi" }],
+      tool_choice: { type: "tool" }
+    });
+    assert.strictEqual(result.tool_choice, "required");
+
+    const resultEmpty = anthropicBodyToOpenAIChat({
+      model: "x", max_tokens: 100, messages: [{ role: "user", content: "Hi" }],
+      tool_choice: { type: "tool", name: "" }
+    });
+    assert.strictEqual(resultEmpty.tool_choice, "required");
+  });
+
   it("injects chat_template_kwargs by default when thinking is enabled", () => {
     const result = anthropicBodyToOpenAIChat({
       model: "x", max_tokens: 100, messages: [{ role: "user", content: "Hi" }],
@@ -282,6 +300,36 @@ describe("createOpenAIToAnthropicSSETranslator", () => {
     assert.ok(out.includes("message_delta"));
     assert.ok(out.includes("message_stop"));
     assert.ok(out.includes('"stop_reason":"end_turn"'));
+  });
+
+  it("finalize is a no-op once translate has emitted the natural finish", () => {
+    // Regression: handlers (handlers.js:217-241) call finalize() on the
+    // upstream `[DONE]` line, which arrives AFTER the chunk that carried
+    // finish_reason. Without a stopEmitted guard, finalize would emit a
+    // second message_delta with hard-coded stop_reason:"end_turn", clobbering
+    // the real stop_reason (e.g. "tool_use") from the natural finish — so an
+    // Anthropic client mistakes a tool-call turn for a normal end.
+    const t = createOpenAIToAnthropicSSETranslator("msg_1", "gpt-4");
+    const finishOut = t.translate({
+      choices: [{
+        delta: { tool_calls: [{ index: 0, id: "call_x", function: { name: "search", arguments: "{}" } }] },
+        finish_reason: "tool_calls"
+      }]
+    });
+    assert.ok(finishOut.includes('"stop_reason":"tool_use"'), "translate must emit tool_use stop_reason");
+
+    // Subsequent finalize must NOT re-emit message_delta / message_stop.
+    const tail = t.finalize();
+    assert.strictEqual(tail, "", "finalize after natural finish must be a no-op");
+
+    // Combined output should carry exactly one message_delta and one message_stop.
+    const combined = finishOut + tail;
+    const deltaCount = (combined.match(/"type":"message_delta"/g) || []).length;
+    const stopCount = (combined.match(/"type":"message_stop"/g) || []).length;
+    assert.strictEqual(deltaCount, 1, "exactly one message_delta in combined stream");
+    assert.strictEqual(stopCount, 1, "exactly one message_stop in combined stream");
+    // And the surviving stop_reason must be the real one, not "end_turn".
+    assert.ok(!combined.includes('"stop_reason":"end_turn"'), "must not contain the fallback end_turn stop_reason");
   });
 
   it("getUsage returns accumulated usage", () => {
@@ -471,6 +519,36 @@ describe("openaiBodyToAnthropic", () => {
     });
     assert.strictEqual(result.tool_choice, undefined);
     assert.strictEqual(result.tools, undefined);
+  });
+
+  it("converts object-form tool_choice {type:'function', function:{name}} → Anthropic {type:'tool', name}", () => {
+    const result = openaiBodyToAnthropic({
+      model: "x", max_tokens: 100, messages: [{ role: "user", content: "Hi" }],
+      tool_choice: { type: "function", function: { name: "search" } }
+    });
+    assert.deepStrictEqual(result.tool_choice, { type: "tool", name: "search" });
+  });
+
+  it("downgrades object-form tool_choice without function.name to {type:'any'}", () => {
+    // Old behavior emitted `{type:"tool", name:""}` which Anthropic rejects with 400.
+    // Preserve "must use a tool" intent by mapping to `any`.
+    const noFn = openaiBodyToAnthropic({
+      model: "x", max_tokens: 100, messages: [{ role: "user", content: "Hi" }],
+      tool_choice: { type: "function" }
+    });
+    assert.deepStrictEqual(noFn.tool_choice, { type: "any" });
+
+    const emptyFn = openaiBodyToAnthropic({
+      model: "x", max_tokens: 100, messages: [{ role: "user", content: "Hi" }],
+      tool_choice: { type: "function", function: {} }
+    });
+    assert.deepStrictEqual(emptyFn.tool_choice, { type: "any" });
+
+    const emptyName = openaiBodyToAnthropic({
+      model: "x", max_tokens: 100, messages: [{ role: "user", content: "Hi" }],
+      tool_choice: { type: "function", function: { name: "" } }
+    });
+    assert.deepStrictEqual(emptyName.tool_choice, { type: "any" });
   });
 
   it("synthesizes a tool_result placeholder for unpaired trailing tool_use", () => {

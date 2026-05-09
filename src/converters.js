@@ -171,6 +171,11 @@ function anthropicBodyToOpenAIChat(body, backend) {
     else if (tc.type === "tool" && tc.name) {
       req.tool_choice = { type: "function", function: { name: tc.name } };
     }
+    // `type:"tool"` without a `name` is malformed Anthropic input. Rather
+    // than silently dropping the constraint (which would let the model pick
+    // any tool or none), preserve the caller's intent of "must use a tool"
+    // by mapping to Chat `required`.
+    else if (tc.type === "tool") req.tool_choice = "required";
     // Anthropic's `disable_parallel_tool_use` is valid on auto/any/tool; map
     // it to Chat's `parallel_tool_calls:false` regardless of which choice
     // mode was picked so the constraint survives the hop.
@@ -281,6 +286,7 @@ function openaiChatResponseToAnthropic(openaiRes) {
 
 function createOpenAIToAnthropicSSETranslator(msgId, model) {
   let started = false;
+  let stopEmitted = false;
   let thinkingOpen = false;
   let thinkingIndex = -1;
   let textOpen = false;
@@ -426,7 +432,7 @@ function createOpenAIToAnthropicSSETranslator(msgId, model) {
 
       if (chunk.usage) usage = chunk.usage;
 
-      if (choice.finish_reason) {
+      if (choice.finish_reason && !stopEmitted) {
         parts.push(closeAll());
         const stop = mapStopReason(choice.finish_reason);
         parts.push(`data: ${JSON.stringify({
@@ -435,12 +441,13 @@ function createOpenAIToAnthropicSSETranslator(msgId, model) {
           usage: usageToAnthropicShape(usage)
         })}\n\n`);
         parts.push(`data: ${JSON.stringify({ type: "message_stop" })}\n\n`);
+        stopEmitted = true;
       }
 
       return parts.join("");
     },
     finalize() {
-      if (!started) return "";
+      if (!started || stopEmitted) return "";
       const parts = [closeAll()];
       parts.push(`data: ${JSON.stringify({
         type: "message_delta",
@@ -448,6 +455,7 @@ function createOpenAIToAnthropicSSETranslator(msgId, model) {
         usage: usageToAnthropicShape(usage)
       })}\n\n`);
       parts.push(`data: ${JSON.stringify({ type: "message_stop" })}\n\n`);
+      stopEmitted = true;
       return parts.join("");
     },
     getUsage() { return usage; }
@@ -680,7 +688,18 @@ function openaiBodyToAnthropic(body) {
       // unset so Anthropic defaults to auto with no tools available.
       delete req.tools;
     }
-    else if (typeof body.tool_choice === "object") req.tool_choice = { type: "tool", name: body.tool_choice.function?.name || "" };
+    else if (typeof body.tool_choice === "object") {
+      const fnName = body.tool_choice.function?.name;
+      if (fnName) {
+        req.tool_choice = { type: "tool", name: fnName };
+      } else {
+        // Object-form `{type:"function"}` without a `function.name` would
+        // translate to Anthropic `{type:"tool", name:""}`, which Anthropic
+        // rejects with a 400. Preserve the caller's "must call a tool"
+        // intent by downgrading to `any`.
+        req.tool_choice = { type: "any" };
+      }
+    }
   }
   // Chat's `parallel_tool_calls:false` ⇒ Anthropic's tool_choice.disable_parallel_tool_use.
   // Only valid on Anthropic when tool_choice is set (auto/any/tool); if the
