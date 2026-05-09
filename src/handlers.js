@@ -96,29 +96,44 @@ function sendUpstreamError({ err, ctx, backend, res, req, finish, format }) {
  */
 function relayUpstreamErrorBody({ statusCode, upstreamBody, ctx, backend, res, req, finish, format, label, abort }) {
   if (statusCode < 400) return false;
+  // Safety net: upstream error bodies are typically tiny (a few KB), but a
+  // buggy or hanged upstream may never close. Abandon after 10s so we don't
+  // accumulate 25-second elapsed on what should be a fast 4xx/5xx path.
+  const BODY_TIMEOUT_MS = 10_000;
+  // Idempotency guard — whichever of end / error / timeout / close fires first wins.
+  let bodyFinished = false;
+  const finishBody = (reason) => {
+    if (bodyFinished) return;
+    bodyFinished = true;
+    clearTimeout(bodyTimer);
+    if (typeof abort === "function") { try { abort(reason); } catch {} }
+    onBackendError(backend);
+    incMetric("upstream_errors");
+    ctx.end(statusCode, { backend: backend.provider });
+    if (finish) finish();
+    try { res.destroy(); } catch {}
+  };
+  const bodyTimer = setTimeout(() => finishBody("body_timeout"), BODY_TIMEOUT_MS);
   // If the downstream client (or fronting proxy) closes the socket while
   // we're still buffering the upstream error body, abort the upstream
-  // request so we don't keep draining the connection — and stop wasting
-  // wall-clock time before recording the request outcome.
-  let clientGone = false;
-  res.on("close", () => {
-    if (clientGone) return;
-    clientGone = true;
-    if (!res.writableEnded && typeof abort === "function") {
-      try { abort("client_disconnected"); } catch {}
-    }
-  });
+  // request so we don't keep draining the connection.
+  const onClose = () => finishBody("client_disconnected");
+  res.on("close", onClose);
   const chunks = [];
   let len = 0;
   upstreamBody.on("data", c => { chunks.push(c); len += c.length; });
   upstreamBody.on("end", () => {
+    if (bodyFinished) return;
+    bodyFinished = true;
+    res.off("close", onClose);
+    clearTimeout(bodyTimer);
     const rawBody = Buffer.concat(chunks, len).toString("utf8");
     const { system } = require("./logger");
     system("warn", `upstream ${statusCode} body (${label || "passthrough"}): ${rawBody.slice(0, 4000)}`,
       { backend: backend.provider, rid: ctx.rid });
     let parsed;
     try { parsed = JSON.parse(rawBody); } catch {}
-    if (!res.headersSent && !clientGone) {
+    if (!res.headersSent) {
       const body = format === "anthropic"
         ? (parsed && parsed.error ? parsed : { error: { message: rawBody, type: "upstream_error", code: statusCode } })
         : (parsed && parsed.error ? parsed : { error: { message: rawBody, type: "upstream_error", code: statusCode } });
@@ -136,8 +151,9 @@ function relayUpstreamErrorBody({ statusCode, upstreamBody, ctx, backend, res, r
     if (finish) finish();
   });
   upstreamBody.on("error", err => sendUpstreamError({ err, ctx, backend, res, req, finish, format }));
+  upstreamBody.on("close", () => finishBody("upstream_closed"));
   return true;
-}
+ }
 
 function injectStreamOptions(bodyStr) {
   try {
