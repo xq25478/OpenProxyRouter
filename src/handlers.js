@@ -9,6 +9,7 @@ const {
   anthropicResponseToOpenAIChat,
   createAnthropicToOpenAISSETranslator,
   parseAnthropicSSEUsage,
+  sanitizeAnthropicBody,
 } = require("./converters");
 const {
   doUpstream, upstreamErrStatus, onBackendError, onBackendSuccess, resolveApiKey,
@@ -94,39 +95,12 @@ function sendUpstreamError({ err, ctx, backend, res, req, finish, format }) {
  * "we have an open upstream body, status>=400, no headers sent yet". Returns
  * true when it took ownership of the response, false otherwise.
  */
-function relayUpstreamErrorBody({ statusCode, upstreamBody, ctx, backend, res, req, finish, format, label, abort }) {
+function relayUpstreamErrorBody({ statusCode, upstreamBody, ctx, backend, res, req, finish, format, label }) {
   if (statusCode < 400) return false;
-  // Safety net: upstream error bodies are typically tiny (a few KB), but a
-  // buggy or hanged upstream may never close. Abandon after 10s so we don't
-  // accumulate 25-second elapsed on what should be a fast 4xx/5xx path.
-  const BODY_TIMEOUT_MS = 10_000;
-  // Idempotency guard — whichever of end / error / timeout / close fires first wins.
-  let bodyFinished = false;
-  const finishBody = (reason) => {
-    if (bodyFinished) return;
-    bodyFinished = true;
-    clearTimeout(bodyTimer);
-    if (typeof abort === "function") { try { abort(reason); } catch {} }
-    onBackendError(backend);
-    incMetric("upstream_errors");
-    ctx.end(statusCode, { backend: backend.provider });
-    if (finish) finish();
-    try { res.destroy(); } catch {}
-  };
-  const bodyTimer = setTimeout(() => finishBody("body_timeout"), BODY_TIMEOUT_MS);
-  // If the downstream client (or fronting proxy) closes the socket while
-  // we're still buffering the upstream error body, abort the upstream
-  // request so we don't keep draining the connection.
-  const onClose = () => finishBody("client_disconnected");
-  res.on("close", onClose);
   const chunks = [];
   let len = 0;
   upstreamBody.on("data", c => { chunks.push(c); len += c.length; });
   upstreamBody.on("end", () => {
-    if (bodyFinished) return;
-    bodyFinished = true;
-    res.off("close", onClose);
-    clearTimeout(bodyTimer);
     const rawBody = Buffer.concat(chunks, len).toString("utf8");
     const { system } = require("./logger");
     system("warn", `upstream ${statusCode} body (${label || "passthrough"}): ${rawBody.slice(0, 4000)}`,
@@ -139,10 +113,9 @@ function relayUpstreamErrorBody({ statusCode, upstreamBody, ctx, backend, res, r
         : (parsed && parsed.error ? parsed : { error: { message: rawBody, type: "upstream_error", code: statusCode } });
       json(res, statusCode, body, req);
     } else {
-      // Either headers already went out (SSE writeHead(200) raced ahead) or
-      // the client disconnected while we were buffering. Either way we
-      // can no longer send a structured 4xx/5xx body — destroy so the
-      // client sees a broken connection rather than a hung "completed".
+      // Headers already sent (e.g. SSE writeHead(200) raced ahead). Best we
+      // can do is destroy so the client sees a broken stream rather than a
+      // hung "completed" response.
       try { res.destroy(); } catch {}
     }
     onBackendError(backend);
@@ -151,9 +124,8 @@ function relayUpstreamErrorBody({ statusCode, upstreamBody, ctx, backend, res, r
     if (finish) finish();
   });
   upstreamBody.on("error", err => sendUpstreamError({ err, ctx, backend, res, req, finish, format }));
-  upstreamBody.on("close", () => finishBody("upstream_closed"));
   return true;
- }
+}
 
 function injectStreamOptions(bodyStr) {
   try {
@@ -164,56 +136,6 @@ function injectStreamOptions(bodyStr) {
     }
   } catch {}
   return bodyStr;
-}
-
-/**
- * Claude Code can replay tool-search/tool-reference history where a
- * `tool_result.content[]` block has `{type:"tool_reference"}` but omits the
- * required `tool_name`. Anthropic-compatible validators reject that with
- * `tool_result.content.0.tool_reference.tool_name: Field required`.
- *
- * The missing value is recoverable from the matching prior assistant
- * `tool_use` block: `tool_result.tool_use_id` points at `tool_use.id`, whose
- * `name` is exactly the required `tool_name`.
- */
-function normalizeAnthropicToolReferences(body) {
-  if (!body || typeof body !== "object" || !Array.isArray(body.messages)) return body;
-
-  const toolNameByUseId = new Map();
-  for (const msg of body.messages) {
-    if (!msg || msg.role !== "assistant" || !Array.isArray(msg.content)) continue;
-    for (const block of msg.content) {
-      if (block && block.type === "tool_use" && block.id && block.name) {
-        toolNameByUseId.set(block.id, block.name);
-      }
-    }
-  }
-
-  const fallbackToolName = Array.isArray(body.tools) && body.tools.length === 1 && body.tools[0]?.name
-    ? body.tools[0].name
-    : "";
-
-  for (const msg of body.messages) {
-    if (!msg || msg.role !== "user" || !Array.isArray(msg.content)) continue;
-    for (const result of msg.content) {
-      if (!result || result.type !== "tool_result" || !Array.isArray(result.content)) continue;
-      const inferredName = toolNameByUseId.get(result.tool_use_id) || fallbackToolName;
-      if (!inferredName) continue;
-
-      for (const part of result.content) {
-        if (!part || part.type !== "tool_reference") continue;
-        if (typeof part.tool_name !== "string" || part.tool_name.length === 0) {
-          part.tool_name = inferredName;
-        }
-        if (part.tool_reference && typeof part.tool_reference === "object" &&
-            (typeof part.tool_reference.tool_name !== "string" || part.tool_reference.tool_name.length === 0)) {
-          part.tool_reference.tool_name = inferredName;
-        }
-      }
-    }
-  }
-
-  return body;
 }
 
 
@@ -231,6 +153,43 @@ function attachClientDisconnect(res, ctx, abort) {
     }
     if (typeof ctx.flushOnClose === "function") ctx.flushOnClose();
   });
+}
+
+/**
+ * SSE keepalive watchdog. Long extended-thinking turns can produce no
+ * visible bytes for tens of seconds (Anthropic emits `ping` events but
+ * intermediate proxies / corporate LBs / browsers still treat the
+ * connection as idle and may close it after ~30s of silence — manifesting
+ * to the user as the response being cut short).
+ *
+ * We send a single SSE comment line (`:keepalive\n\n`) every `intervalMs`
+ * if no data has been written by the upstream pipeline since the last
+ * heartbeat. Comment lines are silently ignored by all SSE parsers per
+ * spec, so they don't pollute the event stream.
+ *
+ * Returns a `{ touch, stop }` pair: callers must invoke `touch()` on every
+ * `res.write(...)` of real upstream data so a heartbeat isn't queued
+ * needlessly, and `stop()` from their `end`/`error` handlers to drop the
+ * timer. The heartbeat also stops automatically when `res` closes.
+ */
+function startSSEHeartbeat(res, intervalMs = 15_000) {
+  let lastActivity = Date.now();
+  let stopped = false;
+  const tick = () => {
+    if (stopped) return;
+    if (res.writableEnded || res.destroyed) { stopped = true; return; }
+    if (Date.now() - lastActivity >= intervalMs) {
+      try { res.write(": keepalive\n\n"); lastActivity = Date.now(); } catch {}
+    }
+  };
+  const handle = setInterval(tick, intervalMs);
+  // Keep the timer from holding the event loop open during shutdown.
+  if (typeof handle.unref === "function") handle.unref();
+  res.on("close", () => { stopped = true; clearInterval(handle); });
+  return {
+    touch() { lastActivity = Date.now(); },
+    stop() { stopped = true; clearInterval(handle); },
+  };
 }
 
 function ctxMeta(ctx, backend, model, stream, endpoint, clientFormat) {
@@ -273,7 +232,7 @@ async function proxyOpenAIChat(req, res, ctx, backend, body) {
   if (statusCode >= 400) {
     return relayUpstreamErrorBody({
       statusCode, upstreamBody, ctx, backend, res, req, finish,
-      format: "anthropic", label: "Anthropic→OpenAI-Chat", abort,
+      format: "anthropic", label: "Anthropic→OpenAI-Chat",
     });
   }
 
@@ -289,6 +248,7 @@ async function proxyOpenAIChat(req, res, ctx, backend, body) {
     const translator = createOpenAIToAnthropicSSETranslator(msgId, model);
     const parser = createSSEParser();
     let doneSent = false;
+    const heartbeat = startSSEHeartbeat(res);
 
     upstreamBody.on("data", chunk => {
       if (typeof ctx.markTTFT === "function") ctx.markTTFT();
@@ -300,9 +260,11 @@ async function proxyOpenAIChat(req, res, ctx, backend, body) {
         if (d === "[DONE]") {
           const tail = translator.finalize();
           if (tail) outs.push(tail);
-          // Anthropic SSE has no `data: [DONE]` terminator — `message_stop`
-          // (emitted by translator.finalize()) is the canonical end. Strict
-          // Anthropic clients (anthropic-sdk-js) raise on unknown payloads.
+          // No `data: [DONE]\n\n` — Anthropic's SSE protocol terminates on
+          // `event: message_stop`, which `translator.finalize()` already
+          // emitted (or was emitted earlier when the upstream's
+          // `finish_reason` chunk arrived). Adding [DONE] confuses strict
+          // Anthropic clients.
           doneSent = true;
           return;
         }
@@ -312,15 +274,41 @@ async function proxyOpenAIChat(req, res, ctx, backend, body) {
           if (out) outs.push(out);
         } catch {}
       });
-      if (outs.length > 0) res.write(outs.join(""));
+      if (outs.length > 0) { res.write(outs.join("")); heartbeat.touch(); }
     });
     upstreamBody.on("end", () => {
+      // Flush any trailing line that arrived without a terminating newline.
+      // Some upstreams close the stream right after `data: ...[DONE]\n` (or
+      // after the final chunk with no newline at all) — without flushing we
+      // would silently drop the last SSE event, which can manifest as the
+      // last sentence / finish_reason being lost ("output cut short").
+      parser.flush(line => {
+        const s = line.toString("utf8");
+        if (!isSSEDataLine(line)) return;
+        const d = sseDataPayload(line);
+        if (!d) return;
+        if (d === "[DONE]") {
+          const tail = translator.finalize();
+          if (tail) res.write(tail);
+          doneSent = true;
+          return;
+        }
+        try {
+          const openaiChunk = JSON.parse(d);
+          const out = translator.translate(openaiChunk);
+          if (out) res.write(out);
+        } catch {}
+      });
       if (!doneSent) {
         const tail = translator.finalize();
         if (tail) res.write(tail);
-        // No `data: [DONE]` here either — see comment above for why
-        // Anthropic SSE clients should only ever see `message_stop`.
+        // NOTE: do NOT emit `data: [DONE]\n\n` here — this stream is being
+        // delivered to an Anthropic-shape client, whose protocol terminates
+        // on `event: message_stop` (already produced by translator.finalize)
+        // and has no `[DONE]` sentinel. Writing one was harmless on lenient
+        // SDKs but confused stricter Anthropic clients.
       }
+      heartbeat.stop();
       res.end();
       const finalUsage = translator.getUsage();
       if (finalUsage) {
@@ -335,6 +323,7 @@ async function proxyOpenAIChat(req, res, ctx, backend, body) {
       finish();
     });
     upstreamBody.on("error", err => {
+      heartbeat.stop();
       const partial = translator.getUsage && translator.getUsage();
       if (partial) {
         const n = normalizeUsage(partial);
@@ -385,6 +374,7 @@ async function proxyOpenAIChat(req, res, ctx, backend, body) {
 async function proxyAnthropicAsOpenAI(req, res, ctx, backend, parsedBody) {
   const anthropicBody = openaiBodyToAnthropic(parsedBody);
   normalizeThinking(anthropicBody, backend);
+  sanitizeAnthropicBody(anthropicBody);
 
   const suffix = "/v1/messages";
   const fullUrl = backend.baseUrl.replace(/\/+$/, "") + suffix;
@@ -414,7 +404,7 @@ async function proxyAnthropicAsOpenAI(req, res, ctx, backend, parsedBody) {
   if (statusCode >= 400) {
     return relayUpstreamErrorBody({
       statusCode, upstreamBody, ctx, backend, res, req, finish,
-      format: "openai", label: "OpenAI→Anthropic", abort,
+      format: "openai", label: "OpenAI→Anthropic",
     });
   }
 
@@ -430,6 +420,7 @@ async function proxyAnthropicAsOpenAI(req, res, ctx, backend, parsedBody) {
 
     const parser = createSSEParser();
     const translator = createAnthropicToOpenAISSETranslator(chatId, model);
+    const heartbeat = startSSEHeartbeat(res);
 
     upstreamBody.on("data", chunk => {
       if (typeof ctx.markTTFT === "function") ctx.markTTFT();
@@ -438,18 +429,14 @@ async function proxyAnthropicAsOpenAI(req, res, ctx, backend, parsedBody) {
         const converted = translator.translate(line.toString("utf8"));
         if (converted) outs.push(converted);
       });
-      if (outs.length > 0) res.write(outs.join(""));
+      if (outs.length > 0) { res.write(outs.join("")); heartbeat.touch(); }
     });
     upstreamBody.on("end", () => {
       parser.flush(line => {
         const converted = translator.translate(line.toString("utf8"));
         if (converted) res.write(converted);
       });
-      // If the upstream stream ended without a `message_stop` event, the
-      // translator never emitted `data: [DONE]` and the downstream client
-      // would hang. finalize() is a no-op when `[DONE]` was already sent.
-      const tail = translator.finalize();
-      if (tail) res.write(tail);
+      heartbeat.stop();
       res.end();
       const acc = translator.getAcc();
       if (acc.input_tokens || acc.output_tokens) {
@@ -464,6 +451,7 @@ async function proxyAnthropicAsOpenAI(req, res, ctx, backend, parsedBody) {
       finish();
     });
     upstreamBody.on("error", err => {
+      heartbeat.stop();
       const acc = translator.getAcc && translator.getAcc();
       if (acc && (acc.input_tokens || acc.output_tokens)) {
         ctx.attachUsage(acc, {
@@ -548,6 +536,7 @@ async function proxyOpenAIDirect(req, res, ctx, backend, parsedBody, bodyStr) {
   if (isStream) {
     const parser = createSSEParser();
     let acc = { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0 };
+    const heartbeat = startSSEHeartbeat(res);
 
     upstreamBody.on("data", chunk => {
       if (typeof ctx.markTTFT === "function") ctx.markTTFT();
@@ -570,7 +559,7 @@ async function proxyOpenAIDirect(req, res, ctx, backend, parsedBody, bodyStr) {
         }
         outs.push(line.toString("utf8") + "\n");
       });
-      if (outs.length > 0) res.write(outs.join(""));
+      if (outs.length > 0) { res.write(outs.join("")); heartbeat.touch(); }
     });
     upstreamBody.on("end", () => {
       parser.flush(line => { res.write(line.toString("utf8") + "\n"); });
@@ -578,6 +567,7 @@ async function proxyOpenAIDirect(req, res, ctx, backend, parsedBody, bodyStr) {
       // upstream does not end on a trailing newline, append one so strict
       // SSE parsers treat the stream as completed instead of pending.
       res.write("\n");
+      heartbeat.stop();
       res.end();
       if (acc.input_tokens || acc.output_tokens) {
         ctx.attachUsage(acc, {
@@ -591,6 +581,7 @@ async function proxyOpenAIDirect(req, res, ctx, backend, parsedBody, bodyStr) {
       finish();
     });
     upstreamBody.on("error", err => {
+      heartbeat.stop();
       if (acc.input_tokens || acc.output_tokens) {
         ctx.attachUsage(acc, {
           model: parsedBody.model || "",
@@ -638,25 +629,28 @@ async function proxyRequest(req, res, ctx, backend, requestPath, bodyStr) {
   const upstreamUrl = new URL(fullUrl);
   if (upstreamUrl.searchParams.has("beta")) upstreamUrl.searchParams.delete("beta");
 
-  let normalizedBodyStr = bodyStr;
+  // Anthropic-direct passthrough still needs the same body-shape sanitation
+  // we apply to converted bodies. ClaudeCode (and other Anthropic-native
+  // clients) occasionally produce messages with whitespace-only text blocks,
+  // empty tool_result contents, or dangling thinking blocks; Anthropic's
+  // strict 400 ("text content blocks must contain non-whitespace text")
+  // surfaces as an intermittent failure that is otherwise hard to diagnose.
+  // We only rewrite the request body for /v1/messages POSTs that parse as
+  // JSON with a messages array; every other request passes through verbatim.
+  let bodyBuf = bodyStr ? Buffer.from(bodyStr) : undefined;
+  let isStream = false;
   if (bodyStr) {
     try {
       const parsed = JSON.parse(bodyStr);
-      normalizeAnthropicToolReferences(parsed);
-      normalizedBodyStr = JSON.stringify(parsed);
-    } catch {}
-  }
-
-  const bodyBuf = normalizedBodyStr ? Buffer.from(normalizedBodyStr) : undefined;
-  if (bodyBuf && typeof ctx.attachBody === "function") ctx.attachBody(bodyBuf);
-
-  let isStream = false;
-  if (normalizedBodyStr) {
-    try {
-      const parsed = JSON.parse(normalizedBodyStr);
       isStream = parsed.stream === true;
+      if (suffix.includes("/v1/messages") && Array.isArray(parsed.messages)) {
+        sanitizeAnthropicBody(parsed);
+        const rewritten = JSON.stringify(parsed);
+        if (rewritten !== bodyStr) bodyBuf = Buffer.from(rewritten);
+      }
     } catch {}
   }
+  if (bodyBuf && typeof ctx.attachBody === "function") ctx.attachBody(bodyBuf);
 
   // Only a tight allow-list of client headers survives into the upstream
   // request. In particular, the client's Authorization / Cookie / User-Agent
@@ -706,6 +700,7 @@ async function proxyRequest(req, res, ctx, backend, requestPath, bodyStr) {
   if (isStream) {
     const parser = createSSEParser();
     let acc = { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0, model: "" };
+    const heartbeat = startSSEHeartbeat(res);
 
     upstreamBody.on("data", chunk => {
       if (typeof ctx.markTTFT === "function") ctx.markTTFT();
@@ -715,7 +710,7 @@ async function proxyRequest(req, res, ctx, backend, requestPath, bodyStr) {
         parseAnthropicSSEUsage(s, acc);
         outs.push(s + "\n");
       });
-      if (outs.length > 0) res.write(outs.join(""));
+      if (outs.length > 0) { res.write(outs.join("")); heartbeat.touch(); }
     });
     upstreamBody.on("end", () => {
       parser.flush(line => {
@@ -727,6 +722,7 @@ async function proxyRequest(req, res, ctx, backend, requestPath, bodyStr) {
       // upstream does not end on a trailing newline, append one so strict
       // SSE parsers treat the stream as completed instead of pending.
       res.write("\n");
+      heartbeat.stop();
       res.end();
       if (acc.input_tokens || acc.output_tokens) {
         ctx.attachUsage(acc, {
@@ -740,6 +736,7 @@ async function proxyRequest(req, res, ctx, backend, requestPath, bodyStr) {
       finish();
     });
     upstreamBody.on("error", err => {
+      heartbeat.stop();
       if (acc.input_tokens || acc.output_tokens) {
         ctx.attachUsage(acc, {
           model: acc.model || backend.models?.[0] || "",
@@ -784,9 +781,9 @@ module.exports = {
   proxyRequest,
   // exposed for unit tests
   _injectStreamOptions: injectStreamOptions,
-  _normalizeAnthropicToolReferences: normalizeAnthropicToolReferences,
   // exposed for other handler modules
   _relayUpstreamErrorBody: relayUpstreamErrorBody,
   _sendUpstreamError: sendUpstreamError,
   _attachClientDisconnect: attachClientDisconnect,
+  _startSSEHeartbeat: startSSEHeartbeat,
 };

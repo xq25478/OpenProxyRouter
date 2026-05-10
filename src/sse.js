@@ -27,14 +27,26 @@ function createSSEParser() {
   };
 }
 
+// SSE spec (https://html.spec.whatwg.org/multipage/server-sent-events.html)
+// allows the field name to be followed by either ": " OR just ":". Some
+// OpenAI-compatible servers (and Anthropic over Bedrock in some configs)
+// emit `data:{...}` without the space; rejecting those lines silently
+// truncates the stream. We accept either form here and strip a single
+// optional leading space from the payload.
 function isSSEDataLine(line) {
-  return line.length >= 6 &&
-    line[0] === 0x64 && line[1] === 0x61 && line[2] === 0x74 &&
-    line[3] === 0x61 && line[4] === 0x3A && line[5] === 0x20;
+  if (line.length < 5) return false;
+  // "data:" = 0x64 0x61 0x74 0x61 0x3A
+  return line[0] === 0x64 && line[1] === 0x61 && line[2] === 0x74 &&
+    line[3] === 0x61 && line[4] === 0x3A;
 }
 
 function sseDataPayload(line) {
-  return line.subarray(6).toString("utf8").trim();
+  // Skip the "data:" prefix, then a single optional leading space per the
+  // SSE spec ("If the field value starts with a U+0020 SPACE character,
+  // remove it from the field value").
+  let start = 5;
+  if (line.length > 5 && line[5] === 0x20) start = 6;
+  return line.subarray(start).toString("utf8").trim();
 }
 
 module.exports = { createSSEParser, isSSEDataLine, sseDataPayload };

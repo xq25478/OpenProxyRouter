@@ -6,16 +6,14 @@ const { system, requestlog } = require("./src/logger");
 const { incMetric, metricsSnapshot } = require("./src/metrics");
 const {
   backends, modelIndex, modelList, availableModelsStr,
-  loadBackends, watchBackends, isCircuitOpen, tryAcquireCircuit, abortAllInFlight,
+  loadBackends, watchBackends, abortAllInFlight,
   doUpstream, upstreamErrStatus, resolveApiKey, hasApiKey,
-  onBackendError, onBackendSuccess,
 } = require("./src/backend");
 const { normalizeThinking } = require("./src/thinking");
 const { json } = require("./src/http_utils");
 const {
   proxyOpenAIChat, proxyAnthropicAsOpenAI,
   proxyOpenAIDirect, proxyRequest,
-  _normalizeAnthropicToolReferences: normalizeAnthropicToolReferences,
 } = require("./src/handlers");
 const {
   proxyResponsesAsOpenAI, proxyResponsesAsAnthropic,
@@ -154,14 +152,13 @@ const server = http.createServer((req, res) => {
   if ((req.method === "GET" || req.method === "HEAD") && requestPath === "/readyz") {
     ctx.mute();
     const allBackends = backends();
-    const healthyBackends = allBackends.filter(b => !isCircuitOpen(b));
     const storeOk = !store || (store && typeof store.queryTotals === "function");
-    const ready = healthyBackends.length > 0 && storeOk;
+    const ready = allBackends.length > 0 && storeOk;
     const code = ready ? 200 : 503;
     if (req.method === "HEAD") { res.writeHead(code); return res.end(); }
     return json(res, code, {
       status: ready ? "ready" : "not_ready",
-      backends: { total: allBackends.length, healthy: healthyBackends.length },
+      backends: { total: allBackends.length, healthy: allBackends.length },
       models: modelList().length,
       store: store ? "ok" : "unavailable",
     }, req);
@@ -275,7 +272,6 @@ const server = http.createServer((req, res) => {
       parsedBody.model = backendModelId;
 
       normalizeThinking(parsedBody, backend);
-      normalizeAnthropicToolReferences(parsedBody);
 
       if (backend.type !== "anthropic") {
         ctx.end(501, { backend: backend.provider, model: modelId, msg: "count_tokens unsupported" });
@@ -284,10 +280,6 @@ const server = http.createServer((req, res) => {
 
       if (!requireApiKey(req, res, ctx, backend)) return;
 
-      if (!tryAcquireCircuit(backend)) {
-        ctx.end(503, { backend: backend.provider, msg: "circuit open" });
-        return json(res, 503, { error: { type: "backend_unavailable", message: `Backend ${backend.provider} is temporarily unavailable` } }, req);
-      }
 
       ctx.on("route", { backend: backend.provider, model: modelId, upstream_model: backendModelId });
 
@@ -303,9 +295,6 @@ const server = http.createServer((req, res) => {
           "x-api-key": resolveApiKey(req, backend.apiKey),
           host: upstreamUrl.host,
         };
-        if (req.headers["anthropic-beta"]) {
-          upstreamHeaders["anthropic-beta"] = req.headers["anthropic-beta"];
-        }
 
         let up;
         try {
@@ -380,10 +369,6 @@ const server = http.createServer((req, res) => {
 
       if (!requireApiKey(req, res, ctx, backend)) return;
 
-      if (!tryAcquireCircuit(backend)) {
-        ctx.end(503, { backend: backend.provider, msg: "circuit open" });
-        return json(res, 503, { error: { type: "backend_unavailable", message: `Backend ${backend.provider} is temporarily unavailable` } }, req);
-      }
 
       if (backend.type === "openai") {
         const bodyStr = JSON.stringify(parsedBody);
@@ -418,10 +403,6 @@ const server = http.createServer((req, res) => {
 
       if (!requireApiKey(req, res, ctx, backend)) return;
 
-      if (!tryAcquireCircuit(backend)) {
-        ctx.end(503, { backend: backend.provider, msg: "circuit open" });
-        return json(res, 503, { error: { type: "backend_unavailable", message: `Backend ${backend.provider} is temporarily unavailable` } }, req);
-      }
 
       if (backend.type === "openai") {
         return proxyResponsesAsOpenAI(req, res, ctx, backend, parsedBody);
@@ -453,16 +434,11 @@ const server = http.createServer((req, res) => {
 
       parsedBody.model = backendModelId;
       normalizeThinking(parsedBody, backend);
-      normalizeAnthropicToolReferences(parsedBody);
 
       ctx.on("route", { backend: backend.provider, model: modelId, upstream_model: backendModelId });
 
       if (!requireApiKey(req, res, ctx, backend)) return;
 
-      if (!tryAcquireCircuit(backend)) {
-        ctx.end(503, { backend: backend.provider, msg: "circuit open" });
-        return json(res, 503, { error: { type: "backend_unavailable", message: `Backend ${backend.provider} is temporarily unavailable` } }, req);
-      }
 
       if (backend.type === "openai") {
         return proxyOpenAIChat(req, res, ctx, backend, parsedBody);

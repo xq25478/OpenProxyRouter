@@ -47,10 +47,13 @@ describe("sse - createSSEParser", () => {
 });
 
 describe("sse - data-line helpers", () => {
-  it("isSSEDataLine recognizes 'data: ' prefix", () => {
+  it("isSSEDataLine recognizes 'data:' prefix with or without space", () => {
     assert.strictEqual(isSSEDataLine(Buffer.from("data: {}")), true);
     assert.strictEqual(isSSEDataLine(Buffer.from("event: x")), false);
-    assert.strictEqual(isSSEDataLine(Buffer.from("data:no-space")), false);
+    // SSE spec: the space after the colon is optional. Servers that emit
+    // `data:{...}` are still standards-compliant and must be accepted.
+    assert.strictEqual(isSSEDataLine(Buffer.from("data:no-space")), true);
+    assert.strictEqual(isSSEDataLine(Buffer.from("data:")), true);
     assert.strictEqual(isSSEDataLine(Buffer.from("")), false);
     assert.strictEqual(isSSEDataLine(Buffer.from("data: ")), true);
   });
@@ -59,5 +62,8 @@ describe("sse - data-line helpers", () => {
     assert.strictEqual(sseDataPayload(Buffer.from("data: hello")), "hello");
     assert.strictEqual(sseDataPayload(Buffer.from("data: {\"a\":1}")), '{"a":1}');
     assert.strictEqual(sseDataPayload(Buffer.from("data:  spaced  ")), "spaced");
+    // Without the optional leading space the payload still parses cleanly.
+    assert.strictEqual(sseDataPayload(Buffer.from("data:no-space")), "no-space");
+    assert.strictEqual(sseDataPayload(Buffer.from('data:{"a":1}')), '{"a":1}');
   });
 });

@@ -9,11 +9,6 @@ const {
   createOpenAIChatToResponsesSSETranslator,
   usageToResponsesShape,
 } = require("./converters_responses");
-const {
-  responsesBodyToAnthropic,
-  anthropicResponseToResponses,
-  createAnthropicToResponsesSSETranslator,
-} = require("./converters_responses_anthropic");
 
 // ============================================================
 // responsesBodyToOpenAIChat
@@ -135,26 +130,6 @@ test("responsesBodyToOpenAIChat - reasoning.effort passes through as reasoning_e
   assert.strictEqual(chat.reasoning_effort, "high");
 });
 
-test("responsesBodyToOpenAIChat - backend reasoning_effort format keeps reasoning_effort", () => {
-  const chat = responsesBodyToOpenAIChat(
-    { model: "o3", input: "hi", reasoning: { effort: "high" } },
-    { thinking_format: "reasoning_effort" }
-  );
-  assert.strictEqual(chat.reasoning_effort, "high");
-});
-
-test("responsesBodyToOpenAIChat - chat_template_kwargs backend rewrites reasoning to enable_thinking + thinking_budget", () => {
-  const chat = responsesBodyToOpenAIChat(
-    { model: "GLM-5.1", input: "hi", reasoning: { effort: "high" } },
-    { thinking_format: "chat_template_kwargs" }
-  );
-  assert.strictEqual(chat.reasoning_effort, undefined);
-  assert.deepStrictEqual(chat.chat_template_kwargs, {
-    enable_thinking: true,
-    thinking_budget: 16384,
-  });
-});
-
 test("responsesBodyToOpenAIChat - unknown input item types are dropped", () => {
   const chat = responsesBodyToOpenAIChat({
     model: "gpt-4o",
@@ -235,81 +210,6 @@ test("responsesBodyToOpenAIChat - reasoning between function_calls does not spli
 });
 
 // ============================================================
-// Direct Responses <-> Anthropic
-// ============================================================
-
-test("responsesBodyToAnthropic - maps function calls directly to tool_use/tool_result", () => {
-  const anth = responsesBodyToAnthropic({
-    model: "claude",
-    instructions: "Be terse.",
-    input: [
-      { type: "message", role: "user", content: [{ type: "input_text", text: "weather?" }] },
-      { type: "message", role: "assistant", content: [{ type: "output_text", text: "Checking." }] },
-      { type: "function_call", call_id: "call_1", name: "get_weather", arguments: '{"city":"NYC"}' },
-      { type: "function_call_output", call_id: "call_1", output: "72F" },
-    ],
-    tools: [{ type: "function", name: "get_weather", parameters: { type: "object", properties: {} } }],
-    parallel_tool_calls: false,
-  });
-
-  assert.strictEqual(anth.system, "Be terse.");
-  assert.strictEqual(anth.messages[1].role, "assistant");
-  assert.deepStrictEqual(anth.messages[1].content[1], {
-    type: "tool_use",
-    id: "call_1",
-    name: "get_weather",
-    input: { city: "NYC" },
-  });
-  assert.strictEqual(anth.messages[2].role, "user");
-  assert.deepStrictEqual(anth.messages[2].content[0], {
-    type: "tool_result",
-    tool_use_id: "call_1",
-    content: "72F",
-  });
-  assert.strictEqual(anth.tool_choice.disable_parallel_tool_use, true);
-  assert.ok(!JSON.stringify(anth).includes("tool_calls"), "direct Anthropic body must not contain Chat tool_calls");
-});
-
-test("responsesBodyToAnthropic - mixed text and image content becomes Anthropic blocks", () => {
-  const anth = responsesBodyToAnthropic({
-    model: "claude",
-    input: [{ type: "message", role: "user", content: [
-      { type: "input_text", text: "describe" },
-      { type: "input_image", image_url: "data:image/png;base64,abc" },
-    ] }],
-  });
-  assert.ok(Array.isArray(anth.messages[0].content));
-  assert.strictEqual(anth.messages[0].content[0].type, "text");
-  assert.deepStrictEqual(anth.messages[0].content[1], {
-    type: "image",
-    source: { type: "base64", media_type: "image/png", data: "abc" },
-  });
-});
-
-test("anthropicResponseToResponses - maps text, thinking, and tool_use directly", () => {
-  const resp = anthropicResponseToResponses({
-    id: "msg_1",
-    model: "claude",
-    content: [
-      { type: "thinking", thinking: "plan" },
-      { type: "text", text: "Use a tool." },
-      { type: "tool_use", id: "toolu_1", name: "search", input: { q: "x" } },
-    ],
-    stop_reason: "tool_use",
-    usage: { input_tokens: 8, output_tokens: 4 },
-  }, { model: "claude" });
-
-  assert.strictEqual(resp.output[0].type, "reasoning");
-  assert.strictEqual(resp.output[0].summary[0].text, "plan");
-  assert.strictEqual(resp.output[1].type, "message");
-  assert.strictEqual(resp.output[1].content[0].text, "Use a tool.");
-  assert.strictEqual(resp.output[2].type, "function_call");
-  assert.strictEqual(resp.output[2].call_id, "toolu_1");
-  assert.strictEqual(resp.output[2].arguments, '{"q":"x"}');
-  assert.strictEqual(resp.output_text, "Use a tool.");
-});
-
-// ============================================================
 // openaiChatResponseToResponses (non-streaming)
 // ============================================================
 
@@ -359,24 +259,6 @@ test("openaiChatResponseToResponses - tool_calls become function_call items", ()
   assert.strictEqual(item.name, "get_weather");
   assert.strictEqual(item.arguments, '{"city":"NYC"}');
   assert.strictEqual(item.status, "completed");
-});
-
-test("openaiChatResponseToResponses - message.refusal becomes refusal content part", () => {
-  const resp = openaiChatResponseToResponses({
-    model: "gpt-4o",
-    choices: [{
-      index: 0,
-      message: { role: "assistant", content: null, refusal: "I cannot help with that." },
-      finish_reason: "stop",
-    }],
-  }, { model: "gpt-4o" });
-  assert.strictEqual(resp.output.length, 1);
-  assert.strictEqual(resp.output[0].type, "message");
-  assert.deepStrictEqual(resp.output[0].content[0], {
-    type: "refusal",
-    refusal: "I cannot help with that.",
-  });
-  assert.strictEqual(resp.output_text, "");
 });
 
 test("openaiChatResponseToResponses - finish_reason=length maps to incomplete", () => {
@@ -501,24 +383,6 @@ test("ChatToResponsesSSETranslator - tool call stream emits function_call events
   assert.strictEqual(done.data.arguments, '{"city":"NYC"}');
 });
 
-test("ChatToResponsesSSETranslator - refusal stream emits refusal events", () => {
-  const t = createOpenAIChatToResponsesSSETranslator("gpt-4o", {});
-  const out = [
-    t.translate({ choices: [{ delta: { role: "assistant" } }] }),
-    t.translate({ choices: [{ delta: { refusal: "No " } }] }),
-    t.translate({ choices: [{ delta: { refusal: "thanks." }, finish_reason: "stop" }] }),
-    t.finalize(),
-  ].join("");
-  const events = parseResponsesSSE(out);
-  assert.ok(events.some(e => e.event === "response.refusal.delta"));
-  const done = events.find(e => e.event === "response.refusal.done");
-  assert.ok(done);
-  assert.strictEqual(done.data.refusal, "No thanks.");
-  const completed = events.find(e => e.event === "response.completed");
-  assert.strictEqual(completed.data.response.output[0].content[0].type, "refusal");
-  assert.strictEqual(completed.data.response.output[0].content[0].refusal, "No thanks.");
-});
-
 test("ChatToResponsesSSETranslator - mixed text-then-tool closes message before opening tool", () => {
   const t = createOpenAIChatToResponsesSSETranslator("gpt-4o", {});
   const buf = [];
@@ -554,42 +418,6 @@ test("ChatToResponsesSSETranslator - finalize is idempotent", () => {
   const second = t.finalize();
   assert.ok(first.length > 0);
   assert.strictEqual(second, "");
-});
-
-test("AnthropicToResponsesSSETranslator - streams text and tool_use without Chat chunks", () => {
-  const t = createAnthropicToResponsesSSETranslator("claude", { model: "claude" });
-  const out = [
-    t.translate('data: {"type":"message_start","message":{"id":"msg_1","model":"claude","usage":{"input_tokens":8,"output_tokens":0}}}'),
-    t.translate('data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}'),
-    t.translate('data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Checking."}}'),
-    t.translate('data: {"type":"content_block_stop","index":0}'),
-    t.translate('data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"search","input":{}}}'),
-    t.translate('data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\\"q\\":"}}'),
-    t.translate('data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"\\"x\\"}"}}'),
-    t.translate('data: {"type":"content_block_stop","index":1}'),
-    t.translate('data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":6}}'),
-    t.translate('data: {"type":"message_stop"}'),
-    t.finalize(),
-  ].join("");
-  const events = parseResponsesSSE(out);
-  assert.ok(events.some(e => e.event === "response.output_text.delta"));
-  assert.ok(events.some(e => e.event === "response.function_call_arguments.delta"));
-  const done = events.find(e => e.event === "response.function_call_arguments.done");
-  assert.strictEqual(done.data.arguments, '{"q":"x"}');
-  const completed = events.find(e => e.event === "response.completed");
-  assert.strictEqual(completed.data.response.output_text, "Checking.");
-  assert.strictEqual(completed.data.response.output[1].call_id, "toolu_1");
-  assert.deepStrictEqual(completed.data.response.usage, { input_tokens: 8, output_tokens: 6, total_tokens: 14 });
-});
-
-test("AnthropicToResponsesSSETranslator - Anthropic error event becomes response.failed", () => {
-  const t = createAnthropicToResponsesSSETranslator("claude", {});
-  const out = t.translate('data: {"type":"error","error":{"type":"overloaded_error","message":"try later"}}') + t.finalize();
-  const events = parseResponsesSSE(out);
-  const failed = events.find(e => e.event === "response.failed");
-  assert.ok(failed);
-  assert.strictEqual(failed.data.response.status, "failed");
-  assert.strictEqual(failed.data.response.error.message, "try later");
 });
 
 // ============================================================
@@ -854,85 +682,4 @@ test("responsesBodyToOpenAIChat - function_call_output with no matching call is 
     ]
   });
   assert.strictEqual(chat.messages.some(m => m.role === "tool"), false);
-});
-
-// ============================================================
-// Responses → Chat empty-content guards
-// ============================================================
-
-test("responsesBodyToOpenAIChat drops user input items that flatten to empty", () => {
-  const chat = responsesBodyToOpenAIChat({
-    model: "m",
-    input: [
-      { type: "message", role: "user", content: [] },
-      { type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] },
-    ],
-  });
-  assert.strictEqual(chat.messages.length, 1);
-  assert.strictEqual(chat.messages[0].role, "user");
-  assert.strictEqual(chat.messages[0].content, "hi");
-});
-
-test("responsesBodyToOpenAIChat drops fully-empty assistant message turns (no text + no tool_calls)", () => {
-  const chat = responsesBodyToOpenAIChat({
-    model: "m",
-    input: [
-      { type: "message", role: "user", content: "u1" },
-      { type: "message", role: "assistant", content: [] },
-      { type: "message", role: "user", content: "u2" },
-    ],
-  });
-  assert.deepStrictEqual(chat.messages.map(m => ({ role: m.role, content: m.content })), [
-    { role: "user", content: "u1" },
-    { role: "user", content: "u2" },
-  ]);
-});
-
-test("responsesBodyToOpenAIChat keeps assistant turn that has tool_calls but no text", () => {
-  const chat = responsesBodyToOpenAIChat({
-    model: "m",
-    input: [
-      { type: "message", role: "user", content: "u1" },
-      { type: "function_call", call_id: "c1", name: "f", arguments: "{\"x\":1}" },
-      { type: "function_call_output", call_id: "c1", output: "ok" },
-    ],
-  });
-  // assistant message with content:null + tool_calls + tool result follow it
-  const asst = chat.messages.find(m => m.role === "assistant");
-  assert.ok(asst);
-  assert.strictEqual(asst.content, null);
-  assert.ok(Array.isArray(asst.tool_calls));
-  assert.strictEqual(asst.tool_calls[0].function.name, "f");
-});
-
-// ============================================================
-// Responses → Anthropic empty-content guards
-// ============================================================
-
-test("responsesBodyToAnthropic drops user items whose content flattens to empty", () => {
-  const anth = responsesBodyToAnthropic({
-    model: "m",
-    input: [
-      { type: "message", role: "user", content: [] },
-      { type: "message", role: "user", content: "real" },
-    ],
-  });
-  assert.strictEqual(anth.messages.length, 1);
-  assert.strictEqual(anth.messages[0].role, "user");
-  assert.strictEqual(anth.messages[0].content, "real");
-});
-
-test("responsesBodyToAnthropic drops fully-empty assistant turns", () => {
-  const anth = responsesBodyToAnthropic({
-    model: "m",
-    input: [
-      { type: "message", role: "user", content: "u1" },
-      { type: "message", role: "assistant", content: [] },
-      { type: "message", role: "user", content: "u2" },
-    ],
-  });
-  assert.deepStrictEqual(anth.messages.map(m => ({ role: m.role, content: m.content })), [
-    { role: "user", content: "u1" },
-    { role: "user", content: "u2" },
-  ]);
 });

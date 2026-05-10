@@ -3,7 +3,12 @@
 const path = require("path");
 
 const PORT = 29501;
-const TIMEOUT = 300_000;
+// Wall-clock-ish ceiling for an upstream call. NOTE: this is enforced as an
+// IDLE (inactivity) timeout in `doUpstream` — every byte of upstream
+// response resets the watchdog, so a long-running stream that takes 30+
+// minutes overall is fine as long as it keeps producing output. Only true
+// stalls (no upstream activity for `TIMEOUT` ms) trigger an abort.
+const TIMEOUT = 600_000;
 const MAX_BODY_SIZE = 32 * 1024 * 1024;
 const LOCAL_KEEP_ALIVE_TIMEOUT = 65_000;
 const LOCAL_HEADERS_TIMEOUT = 66_000;
@@ -27,9 +32,6 @@ const HOP_BY_HOP = new Set([
 
 const DEFAULT_THINKING_EFFORT = "max";
 const SUPPORTED_THINKING_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
-
-const CIRCUIT_THRESHOLD = 5;
-const CIRCUIT_OPEN_MS = 10_000;
 
 // Optional gateway-side bearer token. When set (non-empty), every non-health
 // request MUST present a matching `Authorization: Bearer <token>` (or
@@ -66,8 +68,6 @@ module.exports = {
   HOP_BY_HOP,
   DEFAULT_THINKING_EFFORT,
   SUPPORTED_THINKING_EFFORTS,
-  CIRCUIT_THRESHOLD,
-  CIRCUIT_OPEN_MS,
   SHUTDOWN_DRAIN_MS,
   DISPATCHER_OPTIONS,
   RETRYABLE_CODES,

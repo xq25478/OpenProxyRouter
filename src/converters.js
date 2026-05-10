@@ -10,10 +10,11 @@ const { budgetToEffort, effortToBudget } = require("./thinking");
 
 /**
  * Flatten an Anthropic `tool_result.content` value into Chat's `role:"tool"`
- * content shape. Anthropic accepts string | [{type:"text"}|{type:"image"}],
- * but OpenAI Chat tool messages only accept text content. Keep text lossless
- * and downgrade images to explicit breadcrumbs instead of sending `image_url`
- * parts that official Chat backends reject for tool messages.
+ * content shape. Anthropic accepts string | [{type:"text"}|{type:"image"}];
+ * Chat traditionally accepts a plain string, but newer OpenAI SDKs tolerate
+ * an array of content parts. Strategy: if every block is text, concatenate to
+ * string (lossless + friendliest to old servers); else emit an array so the
+ * image parts survive.
  */
 function toolResultContentToChat(raw) {
   if (raw == null) return "";
@@ -21,24 +22,31 @@ function toolResultContentToChat(raw) {
   if (!Array.isArray(raw)) {
     try { return JSON.stringify(raw); } catch { return String(raw); }
   }
-  const pieces = [];
+  const parts = [];
+  let onlyText = true;
   for (const b of raw) {
     if (b == null) continue;
-    if (typeof b === "string") { pieces.push(b); continue; }
-    if (b.type === "text" && typeof b.text === "string") { pieces.push(b.text); continue; }
+    if (typeof b === "string") { parts.push({ type: "text", text: b }); continue; }
+    if (b.type === "text" && typeof b.text === "string") { parts.push({ type: "text", text: b.text }); continue; }
     if (b.type === "image") {
+      onlyText = false;
       const src = b.source || {};
-      if (src.type === "url" && src.url) {
-        pieces.push(`[image: ${src.url}]`);
+      if (src.type === "base64" && src.data) {
+        parts.push({ type: "image_url", image_url: { url: `data:${src.media_type || "image/png"};base64,${src.data}` } });
         continue;
       }
-      const mediaType = src.media_type ? ` ${src.media_type}` : "";
-      pieces.push(`[image omitted${mediaType}]`);
+      if (src.type === "url" && src.url) {
+        parts.push({ type: "image_url", image_url: { url: src.url } });
+        continue;
+      }
+      parts.push({ type: "text", text: "[image omitted]" });
       continue;
     }
-    try { pieces.push(JSON.stringify(b)); } catch {}
+    try { parts.push({ type: "text", text: JSON.stringify(b) }); } catch {}
   }
-  return pieces.join("");
+  if (parts.length === 0) return "";
+  if (onlyText) return parts.map(p => p.text).join("");
+  return parts;
 }
 
 function anthropicBodyToOpenAIChat(body, backend) {
@@ -50,16 +58,11 @@ function anthropicBodyToOpenAIChat(body, backend) {
   }
   for (const msg of body.messages || []) {
     if (typeof msg.content === "string") {
-      // Drop empty user/assistant turns rather than forwarding `content:""`,
-      // which OpenAI Chat backends reject for user messages.
-      if (msg.content.length === 0) continue;
       messages.push({ role: msg.role, content: msg.content });
       continue;
     }
     if (!Array.isArray(msg.content)) {
-      // Anthropic schema only allows string | array on `content`; an exotic
-      // value here is malformed input. Skip rather than synthesize an empty
-      // message that the downstream backend will 400 on.
+      messages.push({ role: msg.role, content: "" });
       continue;
     }
     const toolResults = [];
@@ -128,12 +131,7 @@ function anthropicBodyToOpenAIChat(body, backend) {
             parts.push(c.text || JSON.stringify(c));
           }
         }
-        // Drop user/assistant messages whose content evaporated. OpenAI Chat
-        // (and downstream validators) reject `content:""` on user messages,
-        // and forwarding one would force the upstream to 400 the entire
-        // conversation. The original turn carried no renderable signal —
-        // skipping it is the lossless equivalent.
-        if (parts.length === 0) { continue; }
+        if (parts.length === 0) { messages.push({ role: msg.role, content: "" }); continue; }
         if (parts.every(p => typeof p === "string")) {
           messages.push({ role: msg.role, content: parts.join("") });
         } else {
@@ -242,12 +240,6 @@ function openaiChatResponseToAnthropic(openaiRes) {
   }
   // OpenAI allows content=null when tool_calls present; keep at least empty text
   if (typeof msg.content === "string") content.push({ type: "text", text: msg.content });
-  else if (Array.isArray(msg.content)) {
-    for (const b of chatContentToAnthropicBlocks(msg.content)) content.push(b);
-  }
-  if (typeof msg.refusal === "string" && msg.refusal.length > 0) {
-    content.push({ type: "text", text: msg.refusal });
-  }
   if (Array.isArray(msg.tool_calls)) {
     for (const tc of msg.tool_calls) {
       let input = {};
@@ -260,7 +252,7 @@ function openaiChatResponseToAnthropic(openaiRes) {
       });
     }
   }
-  if (content.length === 0) content.push({ type: "text", text: "" });
+  if (content.length === 0) content.push({ type: "text", text: "(empty)" });
 
   // Map OpenAI Chat finish_reason → Anthropic stop_reason using only values
   // Anthropic's Messages API documents: end_turn | max_tokens | stop_sequence
@@ -269,8 +261,7 @@ function openaiChatResponseToAnthropic(openaiRes) {
   // would break a strict Anthropic client.
   const fr = choice?.finish_reason;
   let stopReason = "end_turn";
-  if (typeof msg.refusal === "string" && msg.refusal.length > 0) stopReason = "refusal";
-  else if (fr === "stop") stopReason = "end_turn";
+  if (fr === "stop") stopReason = "end_turn";
   else if (fr === "length") stopReason = "max_tokens";
   else if (fr === "tool_calls" || fr === "function_call") stopReason = "tool_use";
   else if (fr === "content_filter") stopReason = "refusal";
@@ -300,7 +291,6 @@ function createOpenAIToAnthropicSSETranslator(msgId, model) {
   let thinkingIndex = -1;
   let textOpen = false;
   let textIndex = -1;
-  let sawRefusal = false;
   const toolBlocks = new Map();
   let nextIndex = 0;
   let usage = null;
@@ -374,7 +364,6 @@ function createOpenAIToAnthropicSSETranslator(msgId, model) {
   }
 
   function mapStopReason(fr) {
-    if (sawRefusal) return "refusal";
     if (fr === "stop") return "end_turn";
     if (fr === "length") return "max_tokens";
     if (fr === "tool_calls" || fr === "function_call") return "tool_use";
@@ -402,7 +391,6 @@ function createOpenAIToAnthropicSSETranslator(msgId, model) {
 
       const hasToolCalls = Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0;
       const hasText = typeof delta.content === "string" && delta.content.length > 0;
-      const hasRefusal = typeof delta.refusal === "string" && delta.refusal.length > 0;
       const hasReasoning = typeof delta.reasoning_content === "string" && delta.reasoning_content.length > 0;
 
       // Reasoning streams before content; thinking block must close before
@@ -414,7 +402,7 @@ function createOpenAIToAnthropicSSETranslator(msgId, model) {
           delta: { type: "thinking_delta", thinking: delta.reasoning_content }
         })}\n\n`);
       }
-      if ((hasText || hasRefusal || hasToolCalls) && thinkingOpen) parts.push(closeThinking());
+      if ((hasText || hasToolCalls) && thinkingOpen) parts.push(closeThinking());
 
       // Close text block BEFORE opening tool blocks when both appear in same chunk
       if (hasToolCalls && textOpen) parts.push(closeText());
@@ -424,15 +412,6 @@ function createOpenAIToAnthropicSSETranslator(msgId, model) {
         parts.push(`data: ${JSON.stringify({
           type: "content_block_delta", index: textIndex,
           delta: { type: "text_delta", text: delta.content }
-        })}\n\n`);
-      }
-
-      if (hasRefusal) {
-        sawRefusal = true;
-        if (!textOpen) parts.push(openText());
-        parts.push(`data: ${JSON.stringify({
-          type: "content_block_delta", index: textIndex,
-          delta: { type: "text_delta", text: delta.refusal }
         })}\n\n`);
       }
 
@@ -535,7 +514,6 @@ function extractMessageText(content) {
     if (!p) continue;
     if (typeof p === "string") { out.push(p); continue; }
     if (typeof p.text === "string") { out.push(p.text); continue; }
-    if (typeof p.refusal === "string") { out.push(p.refusal); continue; }
     if (p.type === "image_url") { out.push("[image omitted]"); continue; }
     try { out.push(JSON.stringify(p)); } catch {}
   }
@@ -596,7 +574,6 @@ function chatContentToAnthropicBlocks(raw) {
     if (part == null) continue;
     if (typeof part === "string") { if (part) out.push({ type: "text", text: part }); continue; }
     if (part.type === "text") { if (part.text) out.push({ type: "text", text: part.text }); continue; }
-    if (part.type === "refusal") { if (part.refusal) out.push({ type: "text", text: part.refusal }); continue; }
     if (part.type === "image_url") {
       const url = part.image_url?.url || "";
       if (url.startsWith("data:")) {
@@ -655,12 +632,7 @@ function openaiBodyToAnthropic(body) {
           content.push({ type: "tool_use", id: tc.id, name: tc.function?.name || "", input });
         }
       }
-      // Anthropic rejects assistant turns whose content is empty (or carries
-      // a `[{type:"text", text:""}]` block). When neither text, reasoning,
-      // nor tool_calls survived the conversion (e.g. a Chat message that
-      // was nothing but `content:""`), drop the turn rather than synthesize
-      // an empty text block that Bedrock will 400 on.
-      if (content.length === 0) { i += 1; continue; }
+      if (content.length === 0) content.push({ type: "text", text: "(empty)" });
       messages.push({ role: "assistant", content });
       i += 1; continue;
     }
@@ -681,20 +653,11 @@ function openaiBodyToAnthropic(body) {
     }
 
     // Regular user / (assistant that somehow reached here with no tool_calls).
-    // Anthropic rejects user / assistant messages with empty `content`
-    // (string=="" or content==[]) — Bedrock returns 400 ("messages: text
-    // content blocks must contain non-empty text"). Drop empties so we never
-    // forward a malformed turn that the upstream would reject for the whole
-    // batch.
     if (typeof msg.content === "string") {
-      if (msg.content.length > 0) {
-        messages.push({ role: toAnthropicRole(msg.role), content: msg.content });
-      }
+      messages.push({ role: toAnthropicRole(msg.role), content: msg.content });
     } else if (Array.isArray(msg.content)) {
       const content = chatContentToAnthropicBlocks(msg.content);
-      if (content.length > 0) {
-        messages.push({ role: toAnthropicRole(msg.role), content });
-      }
+      messages.push({ role: toAnthropicRole(msg.role), content });
     } else {
       const t = extractMessageText(msg.content);
       if (t) messages.push({ role: toAnthropicRole(msg.role), content: t });
@@ -702,12 +665,7 @@ function openaiBodyToAnthropic(body) {
     i += 1;
   }
 
-  const maxTokens = typeof body.max_completion_tokens === "number"
-    ? body.max_completion_tokens
-    : typeof body.max_tokens === "number"
-      ? body.max_tokens
-      : 4096;
-  const req = { model: body.model, messages, max_tokens: maxTokens };
+  const req = { model: body.model, messages, max_tokens: body.max_tokens || 4096 };
   if (systemParts.length > 0) req.system = systemParts.join("\n\n");
   if (body.stream !== undefined) req.stream = body.stream;
   if (body.temperature !== undefined) req.temperature = body.temperature;
@@ -752,7 +710,7 @@ function openaiBodyToAnthropic(body) {
   }
 
   // Map Chat-side reasoning hints back to Anthropic `thinking`. Two shapes are
-  // recognized so Responses→Chat and Chat→Anthropic paths both preserve
+  // recognized so Responses→Chat→Anthropic and Chat→Anthropic both preserve
   // reasoning intent without any extra wire field:
   //   - OpenAI o-series: `reasoning_effort: "low"|"medium"|"high"|"xhigh"|"max"`
   //   - vLLM / SGLang / DeepSeek / GLM: `chat_template_kwargs.enable_thinking`
@@ -893,8 +851,14 @@ function anthropicResponseToOpenAIChat(anthropicRes) {
   const finishReason = (() => {
     if (toolParts.length > 0) return "tool_calls";
     const sr = anthropicRes.stop_reason;
-    if (sr === "end_turn" || sr === "stop" || sr === "stop_sequence" || sr === "pause_turn") return "stop";
-    if (sr === "max_tokens" || sr === "model_context_window_exceeded") return "length";
+    if (sr === "end_turn" || sr === "stop" || sr === "stop_sequence") return "stop";
+    if (sr === "max_tokens") return "length";
+    // Anthropic `pause_turn` means "the model paused a long-running turn;
+    // the client may resubmit to continue". The closest OpenAI semantic is
+    // `length` (output truncated, more available) — NOT `stop`, because
+    // `stop` signals a complete response and would cause clients to drop
+    // the partial output instead of resuming.
+    if (sr === "pause_turn") return "length";
     if (sr === "tool_use") return "tool_calls";
     if (sr === "refusal" || sr === "content_filter") return "content_filter";
     return "stop";
@@ -938,16 +902,16 @@ function createAnthropicToOpenAISSETranslator(chatId, model) {
   // tool index so parallel tool calls round-trip with the correct shape.
   const toolIndexByAnthIdx = new Map();
   let nextToolIndex = 0;
-  let doneEmitted = false;
 
   function translate(line) {
-    if (!line.startsWith("data: ")) return "";
-    const payload = line.slice(6).trim();
-    if (payload === "[DONE]") {
-      if (doneEmitted) return "";
-      doneEmitted = true;
-      return "data: [DONE]\n\n";
-    }
+    // SSE spec: `data:` may be followed by ": " OR a bare ":" — accept both
+    // so upstreams that omit the space (some Bedrock/openai-compatible
+    // gateways) still translate cleanly instead of being silently dropped.
+    if (!line.startsWith("data:")) return "";
+    let payload = line.slice(5);
+    if (payload.startsWith(" ")) payload = payload.slice(1);
+    payload = payload.trim();
+    if (payload === "[DONE]") return "data: [DONE]\n\n";
 
     let evt;
     try { evt = JSON.parse(payload); } catch { return ""; }
@@ -1016,9 +980,9 @@ function createAnthropicToOpenAISSETranslator(chatId, model) {
       let finishReason = null;
       if (d.stop_reason) {
         const sr = d.stop_reason;
-        if (sr === "end_turn" || sr === "stop" || sr === "stop_sequence" || sr === "pause_turn") finishReason = "stop";
+        if (sr === "end_turn" || sr === "stop" || sr === "stop_sequence") finishReason = "stop";
         else if (sr === "tool_use") finishReason = "tool_calls";
-        else if (sr === "max_tokens" || sr === "model_context_window_exceeded") finishReason = "length";
+        else if (sr === "max_tokens" || sr === "pause_turn") finishReason = "length";
         else if (sr === "refusal" || sr === "content_filter") finishReason = "content_filter";
         else finishReason = "stop";
       }
@@ -1036,8 +1000,6 @@ function createAnthropicToOpenAISSETranslator(chatId, model) {
     }
 
     if (evt.type === "message_stop") {
-      if (doneEmitted) return "";
-      doneEmitted = true;
       return "data: [DONE]\n\n";
     }
 
@@ -1051,8 +1013,6 @@ function createAnthropicToOpenAISSETranslator(chatId, model) {
    * instead of a hung connection.
    */
   function finalize(err) {
-    if (doneEmitted) return "";
-    doneEmitted = true;
     const now = Math.floor(Date.now() / 1000);
     const anthUsage = {
       input_tokens: acc.input_tokens,
@@ -1129,8 +1089,10 @@ function anthropicUsageToOpenAIShape(anthUsage) {
  */
 function parseAnthropicSSEUsage(line, acc) {
   if (!acc || !line || typeof line !== "string") return;
-  if (!line.startsWith("data: ")) return;
-  const payload = line.slice(6).trim();
+  if (!line.startsWith("data:")) return;
+  let payload = line.slice(5);
+  if (payload.startsWith(" ")) payload = payload.slice(1);
+  payload = payload.trim();
   if (payload === "[DONE]") return;
 
   let evt;
@@ -1158,6 +1120,159 @@ function parseAnthropicSSEUsage(line, acc) {
   }
 }
 
+/**
+ * Final-pass sanitizer for an Anthropic Messages request body just before it
+ * leaves the gateway. Anthropic enforces several content-shape invariants
+ * that our converters _try_ to uphold, but degenerate upstream input (empty
+ * tool outputs, whitespace-only text, dangling tool_use without tool_result,
+ * etc.) can still produce a body that gets a 400 like:
+ *
+ *   "messages: text content blocks must contain non-whitespace text"
+ *
+ * Mutating in place keeps callers simple — every proxy path can call this
+ * unconditionally on the object it is about to JSON.stringify.
+ *
+ * Invariants enforced:
+ *   - Every {type:"text"} block has non-whitespace text (whitespace-only or
+ *     empty texts are replaced with a single-character placeholder so the
+ *     turn is preserved without violating the API rule).
+ *   - tool_result.content arrays are similarly cleaned; if cleaning empties
+ *     the array, the tool_result falls back to a "(empty)" string.
+ *   - tool_use blocks always carry a non-empty id and name and an object
+ *     `input` (Anthropic rejects null / array inputs).
+ *   - image blocks without a usable source are dropped rather than 400'd.
+ *   - Messages whose content array becomes empty after cleaning are dropped.
+ *   - Adjacent same-role messages (other than the special user/tool_result
+ *     pairing) are coalesced — Anthropic accepts alternation but a stray
+ *     duplicate role from a buggy client otherwise rolls up into the next
+ *     turn unpredictably.
+ *   - Top-level `system` is normalized to a string (drop if empty/whitespace).
+ */
+function sanitizeAnthropicBody(body) {
+  if (!body || typeof body !== "object") return body;
+
+  if (typeof body.system === "string") {
+    if (!body.system.trim()) delete body.system;
+  } else if (Array.isArray(body.system)) {
+    const parts = [];
+    for (const s of body.system) {
+      if (s == null) continue;
+      if (typeof s === "string") { if (s.trim()) parts.push(s); continue; }
+      if (s.type === "text" && typeof s.text === "string" && s.text.trim()) parts.push(s.text);
+    }
+    if (parts.length === 0) delete body.system;
+    else body.system = parts.join("\n\n");
+  }
+
+  if (!Array.isArray(body.messages)) return body;
+
+  const PLACEHOLDER = "(empty)";
+  const cleanText = t => {
+    if (typeof t !== "string") return PLACEHOLDER;
+    return t.length > 0 && t.trim().length > 0 ? t : PLACEHOLDER;
+  };
+  const cleanToolResultContent = c => {
+    if (typeof c === "string") return c.trim() ? c : PLACEHOLDER;
+    if (!Array.isArray(c)) {
+      if (c == null) return PLACEHOLDER;
+      try { return JSON.stringify(c); } catch { return PLACEHOLDER; }
+    }
+    const parts = [];
+    for (const p of c) {
+      if (!p || typeof p !== "object") continue;
+      if (p.type === "text") {
+        parts.push({ type: "text", text: cleanText(p.text) });
+        continue;
+      }
+      if (p.type === "image" && p.source) { parts.push(p); continue; }
+    }
+    return parts.length > 0 ? parts : PLACEHOLDER;
+  };
+  const isValidImage = src => {
+    if (!src || typeof src !== "object") return false;
+    if (src.type === "base64") return typeof src.media_type === "string" && typeof src.data === "string" && src.data.length > 0;
+    if (src.type === "url") return typeof src.url === "string" && src.url.length > 0;
+    return false;
+  };
+
+  const cleaned = [];
+  for (const msg of body.messages) {
+    if (!msg || typeof msg !== "object") continue;
+    const role = msg.role === "assistant" ? "assistant" : "user";
+
+    let blocks;
+    if (typeof msg.content === "string") {
+      blocks = [{ type: "text", text: cleanText(msg.content) }];
+    } else if (Array.isArray(msg.content)) {
+      blocks = [];
+      for (const b of msg.content) {
+        if (!b || typeof b !== "object") continue;
+        if (b.type === "text") {
+          blocks.push({ ...b, text: cleanText(b.text) });
+          continue;
+        }
+        if (b.type === "thinking") {
+          // Anthropic rejects thinking blocks with empty .thinking; drop in
+          // that case rather than substitute, since thinking is optional.
+          if (typeof b.thinking === "string" && b.thinking.length > 0) blocks.push(b);
+          else if (typeof b.text === "string" && b.text.length > 0) blocks.push({ ...b, thinking: b.text });
+          continue;
+        }
+        if (b.type === "tool_use") {
+          const id = typeof b.id === "string" && b.id ? b.id : `toolu_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
+          const name = typeof b.name === "string" && b.name ? b.name : "unknown_tool";
+          let input = b.input;
+          if (input == null || typeof input !== "object" || Array.isArray(input)) input = {};
+          blocks.push({ ...b, id, name, input });
+          continue;
+        }
+        if (b.type === "tool_result") {
+          blocks.push({
+            ...b,
+            tool_use_id: typeof b.tool_use_id === "string" ? b.tool_use_id : "",
+            content: cleanToolResultContent(b.content),
+          });
+          continue;
+        }
+        if (b.type === "image") {
+          if (isValidImage(b.source)) blocks.push(b);
+          continue;
+        }
+        // Unknown block — keep as-is so future Anthropic block types pass
+        // through, but only if it has some payload to avoid sending {} that
+        // would fail strict validation.
+        if (Object.keys(b).length > 1) blocks.push(b);
+      }
+    } else {
+      blocks = [{ type: "text", text: PLACEHOLDER }];
+    }
+
+    if (blocks.length === 0) continue;
+
+    if (cleaned.length > 0 && cleaned[cleaned.length - 1].role === role) {
+      // Coalesce into the previous same-role message rather than emit two
+      // back-to-back turns of the same role.
+      const prev = cleaned[cleaned.length - 1];
+      const prevContent = Array.isArray(prev.content) ? prev.content : [{ type: "text", text: cleanText(prev.content) }];
+      prev.content = prevContent.concat(blocks);
+      continue;
+    }
+    cleaned.push({ role, content: blocks });
+  }
+
+  // Anthropic requires the first message to be role "user". If somehow we
+  // ended up with a leading assistant turn (e.g. an upstream conversation
+  // template that starts with a primer), prepend a minimal user turn.
+  if (cleaned.length === 0) {
+    cleaned.push({ role: "user", content: [{ type: "text", text: PLACEHOLDER }] });
+  } else if (cleaned[0].role !== "user") {
+    cleaned.unshift({ role: "user", content: [{ type: "text", text: PLACEHOLDER }] });
+  }
+
+  body.messages = cleaned;
+  return body;
+}
+
 module.exports = {
   anthropicBodyToOpenAIChat,
   openaiChatResponseToAnthropic,
@@ -1168,4 +1283,5 @@ module.exports = {
   usageToAnthropicShape,
   anthropicUsageToOpenAIShape,
   parseAnthropicSSEUsage,
+  sanitizeAnthropicBody,
 };

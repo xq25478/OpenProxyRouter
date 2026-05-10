@@ -3,7 +3,7 @@
 const { describe, it, beforeEach } = require("node:test");
 const assert = require("node:assert/strict");
 
-const { backends, modelIndex, modelList, availableModelsStr, resolveApiKey, isCircuitOpen, onBackendError, onBackendSuccess, upstreamErrStatus, resetForTest } = require("./backend");
+const { backends, modelIndex, modelList, availableModelsStr, resolveApiKey, upstreamErrStatus, resetForTest } = require("./backend");
 
 function makeBackend(provider, type) {
   return { provider, type, index: 0, baseUrl: "https://api.example.com", apiKey: "sk-test", models: ["model-a"] };
@@ -23,46 +23,6 @@ describe("backend - resolveApiKey", () => {
   it("returns empty string when no key is available", () => {
     const req = { headers: {} };
     assert.strictEqual(resolveApiKey(req, ""), "");
-  });
-});
-
-describe("backend - circuit breaker", () => {
-  it("circuit is closed by default", () => {
-    const b = makeBackend("provider-x", "anthropic");
-    assert.strictEqual(isCircuitOpen(b), false);
-  });
-
-  it("opens after threshold consecutive errors", () => {
-    const b = makeBackend("provider-x", "anthropic");
-    const { CIRCUIT_THRESHOLD } = require("./config");
-    for (let i = 0; i < CIRCUIT_THRESHOLD; i++) {
-      assert.strictEqual(isCircuitOpen(b), false);
-      onBackendError(b);
-    }
-    assert.strictEqual(isCircuitOpen(b), true);
-  });
-
-  it("resets on success", () => {
-    const b = makeBackend("provider-x", "anthropic");
-    const { CIRCUIT_THRESHOLD } = require("./config");
-    for (let i = 0; i < CIRCUIT_THRESHOLD; i++) {
-      onBackendError(b);
-    }
-    assert.strictEqual(isCircuitOpen(b), true);
-    onBackendSuccess(b);
-    assert.strictEqual(isCircuitOpen(b), false);
-    assert.strictEqual(b.consecutiveErrors, 0);
-  });
-
-  it("circuit auto-resets after timeout", () => {
-    const b = makeBackend("provider-x", "anthropic");
-    const { CIRCUIT_THRESHOLD } = require("./config");
-    for (let i = 0; i < CIRCUIT_THRESHOLD; i++) {
-      onBackendError(b);
-    }
-    assert.strictEqual(isCircuitOpen(b), true);
-    b.circuitOpenUntil = Date.now() - 1000;
-    assert.strictEqual(isCircuitOpen(b), false);
   });
 });
 

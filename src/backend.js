@@ -3,7 +3,7 @@
 const fs = require("fs");
 const { Agent: UndiciAgent, request: undiciRequest } = require("undici");
 const { system } = require("./logger");
-const { BACKENDS_PATH, TIMEOUT, DISPATCHER_OPTIONS, RETRYABLE_CODES, CIRCUIT_THRESHOLD, CIRCUIT_OPEN_MS } = require("./config");
+const { BACKENDS_PATH, TIMEOUT, DISPATCHER_OPTIONS, RETRYABLE_CODES } = require("./config");
 const { VALID_THINKING_FORMATS } = require("./thinking");
 
 let backends = [];
@@ -24,60 +24,16 @@ function upstreamErrStatus(err) {
   return 502;
 }
 
-function circuitState(backend) {
-  if (!backend.circuitOpenUntil) return "closed";
-  if (Date.now() < backend.circuitOpenUntil) return "open";
-  return "half_open";
-}
-
-function isCircuitOpen(backend) {
-  // Pure predicate — "open" only. half_open is treated as available for passive checks.
-  return circuitState(backend) === "open";
-}
-
-function tryAcquireCircuit(backend) {
-  // Side-effectful gate for the request path: returns false when the request
-  // should be rejected with 503. In half_open state, allows exactly one probe
-  // at a time; others are blocked until the probe settles.
-  const state = circuitState(backend);
-  if (state === "closed") return true;
-  if (state === "open") return false;
-  if (backend.halfOpenInflight) return false;
-  backend.halfOpenInflight = true;
-  system("info", `circuit half-open for backend ${backend.provider} — allowing probe`,
-    { backend: backend.provider });
-  return true;
-}
-
-function onBackendError(backend) {
-  const wasProbe = !!backend.halfOpenInflight;
-  backend.halfOpenInflight = false;
-  backend.consecutiveErrors = (backend.consecutiveErrors || 0) + 1;
-  if (wasProbe) {
-    backend.circuitOpenUntil = Date.now() + CIRCUIT_OPEN_MS;
-    system("warn", `circuit re-opened for backend ${backend.provider} — probe failed`,
-      { backend: backend.provider });
-    return;
-  }
-  if (backend.consecutiveErrors >= CIRCUIT_THRESHOLD && circuitState(backend) !== "open") {
-    backend.circuitOpenUntil = Date.now() + CIRCUIT_OPEN_MS;
-    system("warn", `circuit opened for backend ${backend.provider} after ${backend.consecutiveErrors} consecutive errors`,
-      { backend: backend.provider });
-  }
-}
-
-function onBackendSuccess(backend) {
-  const wasProbe = !!backend.halfOpenInflight;
-  backend.halfOpenInflight = false;
-  if (backend.consecutiveErrors || backend.circuitOpenUntil) {
-    backend.consecutiveErrors = 0;
-    backend.circuitOpenUntil = 0;
-    if (wasProbe) {
-      system("info", `circuit closed for backend ${backend.provider} — probe succeeded`,
-        { backend: backend.provider });
-    }
-  }
-}
+// Circuit breaker has been intentionally removed. Every request is forwarded
+// to the upstream and the upstream's real response (success or error) is
+// returned to the client verbatim. The hooks below are kept as no-ops so that
+// existing call sites in handlers / index.js continue to compile without
+// having to plumb conditional logic through every path.
+function circuitState(_backend) { return "closed"; }
+function isCircuitOpen(_backend) { return false; }
+function tryAcquireCircuit(_backend) { return true; }
+function onBackendError(_backend) {}
+function onBackendSuccess(_backend) {}
 
 function isTransientConnectError(err) {
   return !!(err && RETRYABLE_CODES.has(err.code));
@@ -93,9 +49,23 @@ function isTransientConnectError(err) {
 async function doUpstream(url, options, backend, ctx) {
   const ac = new AbortController();
   inFlightAbortControllers.add(ac);
-  const timeout = setTimeout(() => ac.abort("timeout"), TIMEOUT);
+  // Idle (inactivity) timeout — reset every time we observe activity from
+  // the upstream, so a long-running response (e.g. extended thinking +
+  // long generation that takes 10+ minutes wall-clock but never stalls)
+  // is not killed by a wall-clock cap. The previous implementation used a
+  // single `setTimeout(TIMEOUT)` armed at request start, which silently
+  // truncated streams once a single hard wall (default 5 min) elapsed —
+  // observed by callers as "output stops mid-sentence".
+  let timer = setTimeout(() => ac.abort("timeout"), TIMEOUT);
+  const armed = { current: true };
+  const resetIdleTimer = () => {
+    if (!armed.current) return;
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => ac.abort("timeout"), TIMEOUT);
+  };
   const finish = () => {
-    clearTimeout(timeout);
+    armed.current = false;
+    if (timer) { clearTimeout(timer); timer = null; }
     inFlightAbortControllers.delete(ac);
   };
   const call = () => undiciRequest(url, { ...options, signal: ac.signal, dispatcher });
@@ -115,17 +85,23 @@ async function doUpstream(url, options, backend, ctx) {
       } catch (err2) {
         if (ctx && typeof ctx.markUpstream === "function") ctx.markUpstream("end");
         finish();
-        onBackendError(backend);
         throw err2;
       }
     } else {
       if (ctx && typeof ctx.markUpstream === "function") ctx.markUpstream("end");
       finish();
-      onBackendError(backend);
       throw err;
     }
   }
   if (ctx && typeof ctx.markUpstream === "function") ctx.markUpstream("end");
+  // Now that headers are in, switch the timer into idle mode: each chunk
+  // of response body resets the watchdog. Idle silence longer than TIMEOUT
+  // (default 5 min) still aborts — that's long enough to forgive thinking
+  // mode pauses without letting truly stuck connections hang forever.
+  resetIdleTimer();
+  if (r.body && typeof r.body.on === "function") {
+    r.body.on("data", resetIdleTimer);
+  }
   const abort = (reason) => { try { ac.abort(reason); } catch {} };
   return { statusCode: r.statusCode, headers: r.headers, body: r.body, finish, signal: ac.signal, abort };
 }
@@ -195,43 +171,15 @@ function normalizeConfig(parsed) {
   }
   if (errors.length) return { arr: null, errors };
 
-  // Route-level backend alias resolution: a route.backend can reference
-  // another route's name (e.g. "codex-all"). This lets you redirect a set
-  // of client model names by changing one entry rather than N.
-  //
-  // Example:
-  //   { "name": "codex-all",   "backend": "DeepSeek-V4-Flash-FP8" }
-  //   { "name": "gpt-5.4",     "backend": "codex-all" }  // resolves to DeepSeek-V4-Flash-FP8
-  //
-  // Cycles are guarded by a max chain depth equal to the route count.
-  function resolveAlias(key, seen) {
-    if (byModel.has(key)) return key;
-    if (seen.has(key)) return key; // cycle
-    seen.add(key);
-    for (const r of routes) {
-      if (r && typeof r.name === "string" && r.name.trim() === key) {
-        const bk = typeof r.backend === "string" ? r.backend.trim() : "";
-        if (bk && bk !== key) return resolveAlias(bk, seen);
-        break;
-      }
-    }
-    return key;
-  }
-
   for (const r of routes) {
     if (!r || typeof r !== "object") {
       errors.push(`invalid route entry: ${JSON.stringify(r)}`);
       continue;
     }
     const name = typeof r.name === "string" ? r.name.trim() : "";
-    let backendKey = typeof r.backend === "string" ? r.backend.trim() : "";
+    const backendKey = typeof r.backend === "string" ? r.backend.trim() : "";
     if (!name) { errors.push(`route missing .name: ${JSON.stringify(r)}`); continue; }
     if (!backendKey) { errors.push(`route "${name}" missing .backend`); continue; }
-    // Resolve one level of alias before looking up byModel.
-    if (!byModel.has(backendKey)) {
-      const resolved = resolveAlias(backendKey, new Set());
-      if (resolved !== backendKey) backendKey = resolved;
-    }
     const target = byModel.get(backendKey);
     if (!target) { errors.push(`route "${name}" references unknown backend model "${backendKey}"`); continue; }
     target.models.push({ id: name, upstream: target._upstreamModel });

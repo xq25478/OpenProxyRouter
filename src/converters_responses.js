@@ -5,22 +5,21 @@
  *
  * Rationale: Responses API is the newer surface; Chat Completions is still the
  * common wire format supported by every OpenAI-compatible backend we care
- * about. Anthropic Messages has its own direct converter in
- * converters_responses_anthropic.js so Responses items do not have to pass
- * through Chat when the upstream backend speaks Anthropic.
+ * about. Going Responses <-> Chat lets us compose with existing Chat <->
+ * Anthropic converters for backends that speak Messages API, without any
+ * duplicated protocol glue.
  *
  * Unsupported Responses features (documented, not silently altered):
  *   - store / previous_response_id : the gateway is stateless, conversation
  *     state must be managed client-side
  *   - hosted tools (web_search_preview / file_search / computer_use / code_interpreter)
  *     : dropped from request; backends must not rely on hosted execution
- *   - reasoning input items : dropped while downgrading request history to
- *     Chat, except for reasoning.effort which maps to reasoning_effort
+ *   - reasoning summary events : passthrough for openai backends, dropped for
+ *     anthropic backends (no equivalent signal)
  */
 
 const crypto = require("crypto");
 const { normalizeUsage } = require("./usage_recorder");
-const { effortToBudget } = require("./thinking");
 
 // ============================================================
 // ID helpers
@@ -106,7 +105,7 @@ function flattenToolOutput(raw) {
   return pieces.join("");
 }
 
-function responsesBodyToOpenAIChat(body, backend) {
+function responsesBodyToOpenAIChat(body) {
   const messages = [];
 
   // Per Responses spec, `instructions` are a high-priority system directive;
@@ -213,15 +212,7 @@ function responsesBodyToOpenAIChat(body, backend) {
           if (nt === "function_call") { calls.push(items[j]); j += 1; continue; }
           break;
         }
-        const hasTextContent = textMsg && (
-          (typeof textMsg.content === "string" && textMsg.content.length > 0) ||
-          (Array.isArray(textMsg.content) && textMsg.content.length > 0)
-        );
-        // Skip purely-empty assistant turns that carry no text and no
-        // tool_calls — forwarding `{role:"assistant", content:null}` with no
-        // tool_calls is invalid for Chat backends.
-        if (!hasTextContent && calls.length === 0) { i = j; continue; }
-        const merged = { role: "assistant", content: hasTextContent ? textMsg.content : null };
+        const merged = { role: "assistant", content: textMsg ? textMsg.content : null };
         if (calls.length > 0) {
           merged.tool_calls = calls.map(makeToolCall);
           // Chat requires content to be string or null when tool_calls are
@@ -234,14 +225,7 @@ function responsesBodyToOpenAIChat(body, backend) {
       }
 
       const m = toChatMessage(it, role);
-      // Drop user/system messages that flatten to empty string. Chat backends
-      // (and OpenAI's own validator) reject `content:""` on user messages.
-      if (m && (
-        (typeof m.content === "string" && m.content.length > 0) ||
-        (Array.isArray(m.content) && m.content.length > 0)
-      )) {
-        messages.push(m);
-      }
+      if (m) messages.push(m);
       i += 1; continue;
     }
 
@@ -309,37 +293,12 @@ function responsesBodyToOpenAIChat(body, backend) {
     }
   }
 
-  applyResponsesReasoningToChat(out, body, backend);
+  if (body.reasoning && typeof body.reasoning.effort === "string") {
+    // Passthrough: OpenAI's o-series Chat endpoint accepts reasoning_effort.
+    out.reasoning_effort = body.reasoning.effort;
+  }
 
   return out;
-}
-
-/**
- * Translate Responses-API `reasoning.effort` into the wire field expected by
- * the downstream OpenAI-compatible backend. Mirrors `applyThinkingToOpenAIRequest`
- * in `converters.js` so the Responses→Chat path picks up the same provider
- * dispatch as the Anthropic→Chat path: vLLM / SGLang / DeepSeek / GLM expect
- * `chat_template_kwargs:{enable_thinking, thinking_budget}`, OpenAI o-series
- * (and Azure) expect `reasoning_effort:"low"|"medium"|"high"`.
- *
- * Without this, a Responses client targeting a `chat_template_kwargs` backend
- * (DeepSeek, GLM, Qwen reasoner deployments) would silently drop reasoning
- * because those backends ignore the OpenAI-style `reasoning_effort` field.
- *
- * When `backend` is omitted (e.g. unit tests), default to the legacy
- * passthrough so existing callers keep working.
- */
-function applyResponsesReasoningToChat(out, body, backend) {
-  const effort = body && body.reasoning && typeof body.reasoning.effort === "string" ? body.reasoning.effort : null;
-  if (!effort) return;
-  const format = backend && typeof backend.thinking_format === "string" ? backend.thinking_format : null;
-  if (format === "chat_template_kwargs") {
-    const kwargs = { ...(out.chat_template_kwargs || {}), enable_thinking: true, thinking_budget: effortToBudget(effort) };
-    out.chat_template_kwargs = kwargs;
-    return;
-  }
-  // Default + reasoning_effort + unknown formats: passthrough.
-  out.reasoning_effort = effort;
 }
 
 // ============================================================
@@ -411,37 +370,6 @@ function openaiChatResponseToResponses(chatResp, reqBody) {
       content: [{ type: "output_text", text: msg.content, annotations: [] }],
     });
     outputText = msg.content;
-  } else if (Array.isArray(msg.content)) {
-    for (const part of msg.content) {
-      if (!part || typeof part !== "object") continue;
-      if (part.type === "text" && typeof part.text === "string" && part.text.length > 0) {
-        output.push({
-          type: "message",
-          id: rid("msg"),
-          role: "assistant",
-          status: "completed",
-          content: [{ type: "output_text", text: part.text, annotations: [] }],
-        });
-        outputText += part.text;
-      } else if (part.type === "refusal" && typeof part.refusal === "string" && part.refusal.length > 0) {
-        output.push({
-          type: "message",
-          id: rid("msg"),
-          role: "assistant",
-          status: "completed",
-          content: [{ type: "refusal", refusal: part.refusal }],
-        });
-      }
-    }
-  }
-  if (typeof msg.refusal === "string" && msg.refusal.length > 0) {
-    output.push({
-      type: "message",
-      id: rid("msg"),
-      role: "assistant",
-      status: "completed",
-      content: [{ type: "refusal", refusal: msg.refusal }],
-    });
   }
   if (Array.isArray(msg.tool_calls)) {
     for (const tc of msg.tool_calls) {
@@ -653,7 +581,7 @@ function createOpenAIChatToResponsesSSETranslator(model, reqBody) {
     const outputIndex = nextOutputIndex;
     nextOutputIndex += 1;
     output[outputIndex] = item;
-    msg = { id: item.id, outputIndex, contentIndex: 0, textAcc: "", partOpen: false, partKind: null };
+    msg = { id: item.id, outputIndex, contentIndex: 0, textAcc: "", partOpen: false };
     return sseEvent("response.output_item.added", {
       type: "response.output_item.added",
       output_index: outputIndex,
@@ -664,7 +592,6 @@ function createOpenAIChatToResponsesSSETranslator(model, reqBody) {
     const part = { type: "output_text", text: "", annotations: [] };
     output[msg.outputIndex].content[msg.contentIndex] = part;
     msg.partOpen = true;
-    msg.partKind = "output_text";
     return sseEvent("response.content_part.added", {
       type: "response.content_part.added",
       item_id: msg.id,
@@ -684,56 +611,19 @@ function createOpenAIChatToResponsesSSETranslator(model, reqBody) {
       delta: text,
     });
   }
-  function openRefusalPart() {
-    const part = { type: "refusal", refusal: "" };
-    output[msg.outputIndex].content[msg.contentIndex] = part;
-    msg.partOpen = true;
-    msg.partKind = "refusal";
-    return sseEvent("response.content_part.added", {
-      type: "response.content_part.added",
-      item_id: msg.id,
-      output_index: msg.outputIndex,
-      content_index: msg.contentIndex,
-      part,
-    });
-  }
-  function emitRefusalDelta(text) {
-    msg.textAcc += text;
-    output[msg.outputIndex].content[msg.contentIndex].refusal = msg.textAcc;
-    return sseEvent("response.refusal.delta", {
-      type: "response.refusal.delta",
-      item_id: msg.id,
-      output_index: msg.outputIndex,
-      content_index: msg.contentIndex,
-      delta: text,
-    });
-  }
   function closeMessage() {
     if (!msg) return "";
     const parts = [];
     if (msg.partOpen) {
       const doneText = msg.textAcc;
-      const isRefusal = msg.partKind === "refusal";
-      const finalPart = isRefusal
-        ? { type: "refusal", refusal: doneText }
-        : { type: "output_text", text: doneText, annotations: [] };
-      if (isRefusal) {
-        parts.push(sseEvent("response.refusal.done", {
-          type: "response.refusal.done",
-          item_id: msg.id,
-          output_index: msg.outputIndex,
-          content_index: msg.contentIndex,
-          refusal: doneText,
-        }));
-      } else {
-        parts.push(sseEvent("response.output_text.done", {
-          type: "response.output_text.done",
-          item_id: msg.id,
-          output_index: msg.outputIndex,
-          content_index: msg.contentIndex,
-          text: doneText,
-        }));
-      }
+      const finalPart = { type: "output_text", text: doneText, annotations: [] };
+      parts.push(sseEvent("response.output_text.done", {
+        type: "response.output_text.done",
+        item_id: msg.id,
+        output_index: msg.outputIndex,
+        content_index: msg.contentIndex,
+        text: doneText,
+      }));
       parts.push(sseEvent("response.content_part.done", {
         type: "response.content_part.done",
         item_id: msg.id,
@@ -742,7 +632,6 @@ function createOpenAIChatToResponsesSSETranslator(model, reqBody) {
         part: finalPart,
       }));
       msg.partOpen = false;
-      msg.partKind = null;
     }
     const item = output[msg.outputIndex];
     item.status = "completed";
@@ -834,7 +723,6 @@ function createOpenAIChatToResponsesSSETranslator(model, reqBody) {
 
       const hasToolCalls = Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0;
       const hasText = typeof delta.content === "string" && delta.content.length > 0;
-      const hasRefusal = typeof delta.refusal === "string" && delta.refusal.length > 0;
       const hasReasoning = typeof delta.reasoning_content === "string" && delta.reasoning_content.length > 0;
 
       if (hasReasoning) {
@@ -844,20 +732,12 @@ function createOpenAIChatToResponsesSSETranslator(model, reqBody) {
       }
       // Reasoning must be closed before any user-visible output (text or tool)
       // so the `output` array follows the canonical reasoning-then-answer order.
-      if ((hasText || hasRefusal || hasToolCalls) && reasoning) parts.push(closeReasoning());
+      if ((hasText || hasToolCalls) && reasoning) parts.push(closeReasoning());
 
       if (hasText) {
-        if (msg && msg.partOpen && msg.partKind !== "output_text") parts.push(closeMessage());
         if (!msg) parts.push(openMessage());
         if (!msg.partOpen) parts.push(openOutputTextPart());
         parts.push(emitTextDelta(delta.content));
-      }
-
-      if (hasRefusal) {
-        if (msg && msg.partOpen && msg.partKind !== "refusal") parts.push(closeMessage());
-        if (!msg) parts.push(openMessage());
-        if (!msg.partOpen) parts.push(openRefusalPart());
-        parts.push(emitRefusalDelta(delta.refusal));
       }
 
       if (hasToolCalls) {
