@@ -29,23 +29,6 @@ function isTransientConnectError(err) {
 }
 
 /**
- * Record a backend error for the dashboard / metrics counters. Called from
- * every error path after an upstream attempt has already completed or thrown.
- * Pure bookkeeping — does not implement any circuit-breaking logic.
- */
-function onBackendError(backend) {
-  backend.consecutiveErrors = (backend.consecutiveErrors || 0) + 1;
-}
-
-/**
- * Mark a backend attempt as successful so the dashboard reflects health.
- * Resets the consecutive-error counter on the backend object.
- */
-function onBackendSuccess(backend) {
-  if (backend.consecutiveErrors) backend.consecutiveErrors = 0;
-}
-
-/**
  * Call an upstream URL with automatic retry on transient connection errors.
  * Returns { statusCode, headers, body, finish, signal }.
  *
@@ -461,8 +444,6 @@ module.exports = {
   stopWatchBackends,
   doUpstream,
   upstreamErrStatus,
-  onBackendError,
-  onBackendSuccess,
   resolveApiKey,
   hasApiKey,
   abortAllInFlight,
