@@ -559,6 +559,7 @@ function _resetAllToBase(state) {
     e.current = 0;
     e.blackoutUntil = 0;
   }
+  delete state.currentKey;
 }
 
 function _scheduledKey(backendApiKey, backendModel) {
@@ -572,36 +573,44 @@ function _scheduledKey(backendApiKey, backendModel) {
   else _refreshState(state, backendApiKey);
 
   const now = Date.now();
+
+  // Affinity: keep using the current key as long as it is usable (weight > 0
+  // and not in blackout). This preserves prefix cache across requests.
+  const cur = state.currentKey;
+  if (cur) {
+    const curEntry = state.entries.find(e => e.key === cur);
+    if (curEntry && curEntry.weight > 0 && curEntry.blackoutUntil <= now) {
+      // Record this pick for the WRR accounting so the counter doesn't drift.
+      const candidates = state.entries.filter(e => e.weight > 0 && e.blackoutUntil <= now);
+      if (candidates.length > 0) {
+        const total = candidates.reduce((s, e) => s + e.weight, 0);
+        for (const e of candidates) e.current += e.weight;
+        curEntry.current -= total;
+      }
+      return cur;
+    }
+    // Current key became unusable — stickiness broken, fall through to pick
+    // a new one.
+    delete state.currentKey;
+  }
+
   // Build candidate list: weight > 0 AND not in blackout
   const candidates = state.entries.filter(e => e.weight > 0 && e.blackoutUntil <= now);
   if (candidates.length === 0) {
-    // Nothing usable — reset everything and pick the first.
     _resetAllToBase(state);
     return state.entries[0].key;
   }
 
-  // Smooth WRR over candidates only.
+  // Pick one via smooth WRR, then pin it as the affinity key.
   let total = 0;
   for (const e of candidates) total += e.weight;
-  // Anti-starvation: when a key is far heavier than the lightest, give the
-  // lightest key a ~15% random chance of being picked (disabled in test to
-  // keep deterministic assertions).
-  if (total > 0 && candidates.length >= 2) {
-    const minW = Math.min(...candidates.map(e => e.weight));
-    const maxW = Math.max(...candidates.map(e => e.weight));
-    if (maxW >= minW * 3 && minW > 0 && Math.random() < 0.15) {
-      const pick = candidates[Math.floor(Math.random() * candidates.length)];
-      for (const e of candidates) e.current += e.weight;
-      pick.current -= total;
-      return pick.key;
-    }
-  }
   let best = null;
   for (const e of candidates) {
     e.current += e.weight;
     if (!best || e.current > best.current) best = e;
   }
   best.current -= total;
+  state.currentKey = best.key;
   return best.key;
 }
 
@@ -624,13 +633,17 @@ function recordKeyOutcome(backendModel, apiKey, status) {
   } else if (status === 429) {
     entry.weight = Math.max(0, entry.weight - 2);
     entry.blackoutUntil = now + 30_000;
+    if (state.currentKey === apiKey) delete state.currentKey;
   } else if (status === 502 || status === 503 || status === 504) {
     entry.weight = Math.max(0, entry.weight - 2);
     entry.blackoutUntil = now + 10_000;
+    if (state.currentKey === apiKey) delete state.currentKey;
   } else if (status === 401 || status === 403) {
     entry.weight = 0;
+    if (state.currentKey === apiKey) delete state.currentKey;
   } else if (status === 500 || status <= 0) {
     entry.weight = Math.max(0, entry.weight - 1);
+    if (state.currentKey === apiKey) delete state.currentKey;
   }
   // other 4xx -> no weight change (caller bug, not key bug)
 }
