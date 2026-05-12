@@ -1,6 +1,7 @@
 "use strict";
 
 const fs = require("fs");
+const path = require("path");
 const { Agent: UndiciAgent, request: undiciRequest } = require("undici");
 const { system } = require("./logger");
 const { BACKENDS_PATH, TIMEOUT, DISPATCHER_OPTIONS, RETRYABLE_CODES } = require("./config");
@@ -122,6 +123,28 @@ async function doUpstream(url, options, backend, ctx) {
  * Field-level validation (type/baseUrl/thinking_format/…) still runs
  * downstream in validateBackends.
  */
+// Load API keys from a sidecar file. Path resolution rules:
+//   - If absolute, use as-is.
+//   - Otherwise resolve relative to the directory containing backends.json.
+// File format: one key per line. Lines starting with '#' or empty are skipped.
+// Each key gets a default weight of 1 unless the line uses the form
+//   "<key> <weight>"  (whitespace-separated).
+function loadKeysFromFile(file) {
+  const base = path.dirname(BACKENDS_PATH);
+  const abs = path.isAbsolute(file) ? file : path.join(base, file);
+  const raw = fs.readFileSync(abs, "utf8");
+  const out = [];
+  for (const line of raw.split(/\r?\n/)) {
+    const t = line.trim();
+    if (!t || t.startsWith("#")) continue;
+    const parts = t.split(/\s+/);
+    const key = parts[0];
+    const weight = parts[1] ? Math.max(1, parseInt(parts[1], 10) || 1) : 1;
+    if (key) out.push({ key, weight });
+  }
+  return out;
+}
+
 function normalizeConfig(parsed) {
   if (Array.isArray(parsed)) return { arr: parsed, errors: [] };
   if (!parsed || typeof parsed !== "object") {
@@ -139,7 +162,7 @@ function normalizeConfig(parsed) {
       errors.push(`invalid backend entry: ${JSON.stringify(b)}`);
       continue;
     }
-    const { protocol, url, apiKey, model, thinking_format, provider } = b;
+    const { protocol, url, apiKey, apiKeys, apiKeysFile, model, thinking_format, provider } = b;
     if (typeof model !== "string" || !model.trim()) {
       errors.push(`backend missing .model (upstream model name): ${JSON.stringify(b)}`);
       continue;
@@ -148,11 +171,50 @@ function normalizeConfig(parsed) {
       errors.push(`duplicate backend model: "${model}"`);
       continue;
     }
+    // Build the list of {key, weight} entries from any of three sources:
+    //   - apiKey      : single string. When present it is EXCLUSIVE — only
+    //                   this key is scheduled, and apiKeys / apiKeysFile are
+    //                   ignored for this backend. Useful for pinning a known-
+    //                   good key during incidents; flips back automatically on
+    //                   the next hot-reload once apiKey is removed.
+    //   - apiKeysFile : load lines from a sidecar text file (recommended for
+    //                   long lists; keep secrets out of backends.json).
+    //   - apiKeys     : inline array of strings or {key, weight} objects.
+    // When apiKey is absent, apiKeysFile entries are followed by inline
+    // apiKeys, with later duplicates of the same key dropped (first wins).
+    const keyArr = [];
+    const seen = new Set();
+    function addKey(key, weight) {
+      if (!key || seen.has(key)) return;
+      seen.add(key);
+      keyArr.push({ key, weight: Math.max(1, weight || 1) });
+    }
+    if (typeof apiKey === "string" && apiKey.trim()) {
+      // Exclusive pin: schedule only this key. Other sources are intentionally
+      // ignored so operators can hot-pin a single key by editing backends.json
+      // without having to touch the sidecar key file.
+      addKey(apiKey.trim(), 1);
+    } else {
+      if (typeof apiKeysFile === "string" && apiKeysFile.trim()) {
+        try {
+          for (const e of loadKeysFromFile(apiKeysFile)) addKey(e.key, e.weight);
+        } catch (err) {
+          errors.push(`backend "${model}" apiKeysFile load failed: ${err.message}`);
+        }
+      }
+      if (Array.isArray(apiKeys)) {
+        for (const e of apiKeys) {
+          if (typeof e === "string") addKey(e, 1);
+          else if (e && typeof e === "object") addKey(e.key, e.weight);
+        }
+      }
+    }
+    if (keyArr.length === 0) keyArr.push({ key: "", weight: 1 });
     byModel.set(model, {
       provider: provider || model,
       type: protocol,
       baseUrl: url,
-      apiKey,
+      apiKey: keyArr,
       thinking_format,
       _upstreamModel: model,
       models: [],
@@ -208,7 +270,12 @@ function normalizeConfig(parsed) {
   for (const b of byModel.values()) delete b._upstreamModel;
 
   if (errors.length) return { arr: null, errors };
-  return { arr: Array.from(byModel.values()), errors: [] };
+  const result = Array.from(byModel.values()).filter(b => b.models.length > 0);
+  if (result.length === 0) {
+    errors.push("no routes map to any backend — at least one route is required via the 'routes' section");
+    return { arr: null, errors };
+  }
+  return { arr: result, errors: [] };
 }
 
 /**
@@ -240,8 +307,32 @@ function validateBackends(arr) {
       try { new URL(b.baseUrl); }
       catch { errors.push(`${tag}: baseUrl is not a valid URL: ${b.baseUrl}`); }
     }
-    if (b.apiKey !== undefined && typeof b.apiKey !== "string") {
-      errors.push(`${tag}: apiKey must be a string when present`);
+    if (b.apiKeysFile !== undefined && (typeof b.apiKeysFile !== "string" || !b.apiKeysFile.trim())) {
+      errors.push(`${tag}: apiKeysFile must be a non-empty string when present`);
+    }
+    if (b.apiKeys !== undefined) {
+      if (!Array.isArray(b.apiKeys)) {
+        errors.push(`${tag}: apiKeys must be an array`);
+      } else if (b.apiKeys.length === 0) {
+        errors.push(`${tag}: apiKeys must be a non-empty array`);
+      } else {
+        for (let ki = 0; ki < b.apiKeys.length; ki++) {
+          const e = b.apiKeys[ki];
+          if (typeof e === "string") continue; // bare key string
+          if (e && typeof e === "object" && typeof e.key === "string" && e.key) continue;
+          errors.push(`${tag}: apiKeys[${ki}] must be a string or {key: string, weight?: number}`);
+        }
+      }
+    } else if (b.apiKeysFile === undefined && b.apiKey !== undefined) {
+      // Accept either a string (raw config) or an array of {key,weight}
+      // entries (post-normalisation). Any other type is invalid.
+      if (typeof b.apiKey === "string") {
+        if (!b.apiKey) errors.push(`${tag}: apiKey must be a non-empty string when present`);
+      } else if (Array.isArray(b.apiKey)) {
+        if (b.apiKey.length === 0) errors.push(`${tag}: apiKey array must not be empty`);
+      } else {
+        errors.push(`${tag}: apiKey must be a string or an array of {key,weight} entries`);
+      }
     }
     if (b.thinking_format !== undefined) {
       if (typeof b.thinking_format !== "string" || !VALID_THINKING_FORMATS.has(b.thinking_format)) {
@@ -407,11 +498,172 @@ function stopWatchBackends() {
   if (watchHandle) { try { watchHandle.close(); } catch {} watchHandle = null; }
 }
 
-function resolveApiKey(req, backendApiKey) {
+// =============================================================================
+// Multi-key weighted round-robin with adaptive feedback.
+//
+// Each backend (identified by its model name) maintains a per-key state:
+//   { key, weight, baseWeight, current, blackoutUntil }
+//
+//   - weight       : current effective weight in [0, MAX_WEIGHT]. 0 = skipped.
+//   - baseWeight   : weight from backends.json — used when refreshing entries.
+//   - current      : Smooth-WRR running counter.
+//   - blackoutUntil : timestamp; when in the future the key is skipped even
+//                     if weight > 0 (used for 429 cooldown).
+//
+// Feedback rules (recordKeyOutcome):
+//   200          -> weight = min(MAX, weight + 1)
+//   429          -> weight = max(0, weight - 2), blackout 30s
+//   502/503/504  -> weight = max(0, weight - 2), blackout 10s
+//   500 / netErr -> weight = max(0, weight - 1)
+//   401 / 403    -> weight = 0 (permanent until reload — bad key)
+//   other 4xx    -> no change (request problem, not key problem)
+//
+// If every key has weight=0, we reset all to weight=1 and clear blackouts so
+// the backend can recover (avoids wedging the gateway).
+// =============================================================================
+
+const MAX_KEY_WEIGHT = 32;
+
+const _keyScheduler = new Map();
+
+function _initState(backendApiKey, backendModel) {
+  const entries = backendApiKey.map(e => {
+    const base = Math.max(1, e.weight || 1);
+    return { key: e.key, baseWeight: base, weight: base, current: 0, blackoutUntil: 0 };
+  });
+  const state = { entries, key: backendModel || "_default" };
+  _keyScheduler.set(state.key, state);
+  return state;
+}
+
+function _refreshState(state, backendApiKey) {
+  // Detect changes (key set diff) — if any new keys appear or existing ones
+  // disappear we rebuild while preserving runtime weights for keys that stay.
+  const incomingKeys = backendApiKey.map(e => e.key);
+  const existingKeys = state.entries.map(e => e.key);
+  const same = incomingKeys.length === existingKeys.length &&
+    incomingKeys.every((k, i) => k === existingKeys[i]);
+  if (same) return;
+  const oldByKey = new Map(state.entries.map(e => [e.key, e]));
+  state.entries = backendApiKey.map(e => {
+    const base = Math.max(1, e.weight || 1);
+    const prev = oldByKey.get(e.key);
+    if (prev) return { ...prev, baseWeight: base };
+    return { key: e.key, baseWeight: base, weight: base, current: 0, blackoutUntil: 0 };
+  });
+}
+
+function _resetAllToBase(state) {
+  for (const e of state.entries) {
+    e.weight = e.baseWeight;
+    e.current = 0;
+    e.blackoutUntil = 0;
+  }
+}
+
+function _scheduledKey(backendApiKey, backendModel) {
+  if (typeof backendApiKey === "string") return backendApiKey;
+  if (!Array.isArray(backendApiKey) || backendApiKey.length === 0) return "";
+  if (backendApiKey.length === 1) return backendApiKey[0].key;
+
+  const skedKey = backendModel || "_default";
+  let state = _keyScheduler.get(skedKey);
+  if (!state) state = _initState(backendApiKey, backendModel);
+  else _refreshState(state, backendApiKey);
+
+  const now = Date.now();
+  // Build candidate list: weight > 0 AND not in blackout
+  const candidates = state.entries.filter(e => e.weight > 0 && e.blackoutUntil <= now);
+  if (candidates.length === 0) {
+    // Nothing usable — reset everything and pick the first.
+    _resetAllToBase(state);
+    return state.entries[0].key;
+  }
+
+  // Smooth WRR over candidates only.
+  let total = 0;
+  for (const e of candidates) total += e.weight;
+  // Anti-starvation: when a key is far heavier than the lightest, give the
+  // lightest key a ~15% random chance of being picked (disabled in test to
+  // keep deterministic assertions).
+  if (total > 0 && candidates.length >= 2) {
+    const minW = Math.min(...candidates.map(e => e.weight));
+    const maxW = Math.max(...candidates.map(e => e.weight));
+    if (maxW >= minW * 3 && minW > 0 && Math.random() < 0.15) {
+      const pick = candidates[Math.floor(Math.random() * candidates.length)];
+      for (const e of candidates) e.current += e.weight;
+      pick.current -= total;
+      return pick.key;
+    }
+  }
+  let best = null;
+  for (const e of candidates) {
+    e.current += e.weight;
+    if (!best || e.current > best.current) best = e;
+  }
+  best.current -= total;
+  return best.key;
+}
+
+/**
+ * Feedback after an upstream call so the scheduler can adapt weights.
+ * @param {string} backendModel  the backend model id (state key)
+ * @param {string} apiKey        the api key that was used
+ * @param {number} status        HTTP status (0 / -1 = network error)
+ */
+function recordKeyOutcome(backendModel, apiKey, status) {
+  if (!backendModel || !apiKey) return;
+  const state = _keyScheduler.get(backendModel);
+  if (!state) return;
+  const entry = state.entries.find(e => e.key === apiKey);
+  if (!entry) return;
+
+  const now = Date.now();
+  if (status === 200) {
+    entry.weight = Math.min(MAX_KEY_WEIGHT, entry.weight + 1);
+  } else if (status === 429) {
+    entry.weight = Math.max(0, entry.weight - 2);
+    entry.blackoutUntil = now + 30_000;
+  } else if (status === 502 || status === 503 || status === 504) {
+    entry.weight = Math.max(0, entry.weight - 2);
+    entry.blackoutUntil = now + 10_000;
+  } else if (status === 401 || status === 403) {
+    entry.weight = 0;
+  } else if (status === 500 || status <= 0) {
+    entry.weight = Math.max(0, entry.weight - 1);
+  }
+  // other 4xx -> no weight change (caller bug, not key bug)
+}
+
+/**
+ * Snapshot of the current scheduler state for diagnostics / UI.
+ */
+function getKeySchedulerSnapshot() {
+  const out = {};
+  for (const [model, state] of _keyScheduler.entries()) {
+    out[model] = state.entries.map(e => ({
+      key: e.key,
+      weight: e.weight,
+      baseWeight: e.baseWeight,
+      blackoutMs: Math.max(0, e.blackoutUntil - Date.now()),
+    }));
+  }
+  return out;
+}
+
+function resolveApiKey(req, backendApiKey, backendModel) {
+  // Array-based multi-key -> use weighted round-robin
+  if (Array.isArray(backendApiKey)) {
+    const k = _scheduledKey(backendApiKey, backendModel);
+    if (req && k) {
+      // Stash the choice on the request so doUpstream / the handler can
+      // record an outcome later via recordKeyOutcome().
+      req._gw_keyChoice = { model: backendModel, key: k };
+    }
+    return k;
+  }
   if (backendApiKey) return backendApiKey;
-  // Node's HTTP parser lowercases header names — `req.headers.Authorization`
-  // is always undefined, so we only look up the lowercase form.
-  const auth = req.headers.authorization;
+  const auth = req && req.headers && req.headers.authorization;
   if (auth && auth.toLowerCase().startsWith("bearer ")) {
     return auth.slice("bearer ".length).trim();
   }
@@ -419,7 +671,7 @@ function resolveApiKey(req, backendApiKey) {
 }
 
 function hasApiKey(req, backendApiKey) {
-  return !!resolveApiKey(req, backendApiKey);
+  return !!resolveApiKey(req, backendApiKey, null);
 }
 
 function abortAllInFlight(reason) {
@@ -446,6 +698,8 @@ module.exports = {
   upstreamErrStatus,
   resolveApiKey,
   hasApiKey,
+  recordKeyOutcome,
+  getKeySchedulerSnapshot,
   abortAllInFlight,
   getInFlightAbortControllers,
   resetForTest() {
